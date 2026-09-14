@@ -365,11 +365,16 @@ async function boot() {
   writeLine('正在加载内核与工具链（首次约 1~3 分钟，取决于机器性能）…');
 
   try {
-    // 先确认镜像文件都在，避免白等
-    for (const [label, url] of [
-      ['内核', URLS.kernel],
-      ['工具链', URLS.rootfs],
-    ]) {
+    // 先确认镜像文件都在，避免白等。
+    // 工具链优先按分段清单校验（EdgeOne/CF Pages 等 25MB 限制的静态托管上
+    // 完整 rootfs.tar.gz 根本不存在，HEAD 它必然 404）：有清单就逐段 HEAD，
+    // 完全不碰完整镜像；没有清单才回退检查单文件。
+    const mRes = await fetch(new URL('image/rootfs.parts.json', ASSETS), { cache: 'no-store' });
+    const manifest = mRes.ok ? await mRes.json().catch(() => null) : null;
+    const rootfsChecks = manifest?.parts?.length
+      ? manifest.parts.map((p) => [`工具链分段 ${p.name}`, new URL(`image/${p.name}`, ASSETS).href])
+      : [['工具链', URLS.rootfs]];
+    for (const [label, url] of [['内核', URLS.kernel], ...rootfsChecks]) {
       const r = await fetch(url, { method: 'HEAD' });
       if (!r.ok) throw new Error(`${label}缺失（HTTP ${r.status}）`);
     }
