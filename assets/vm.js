@@ -68,16 +68,27 @@ export class MrpVm {
 
   // ---------------------------------------------------------------- 串口
   _attach() {
+    let probe = 0;
     this.emulator.add_listener('serial0-output-byte', (b) => {
       const ch = String.fromCharCode(b);
       this.serial += ch;
       // 长会话下别让缓冲无限增长
       if (this.serial.length > 2_000_000) this.serial = this.serial.slice(-1_000_000);
-      for (const w of [...this.waiters]) {
-        if (w.re.test(this.serial)) {
-          this.waiters.splice(this.waiters.indexOf(w), 1);
-          clearTimeout(w.timer);
-          w.resolve(this.serial);
+      /*
+       * 哨兵（__RCxxxxxx=$? 等）都按行结束，没必要逐字节匹配。
+       * 逐字节对最长 2MB 的累计串跑正则，V8 每次都要先把 rope 字符串扁平化，
+       * 长编译日志下几百万次拷贝会把 Node 直接打出
+       * "Fatal process out of memory: Zone"（实测 dsm_gm 编译两次复现）。
+       * 改为遇到换行时匹配，且只匹配串口尾部 4KB —— 哨兵必然刚输出在末尾。
+       */
+      if (this.waiters.length && (ch === '\n' || ++probe % 64 === 0)) {
+        const tail = this.serial.slice(-4096);
+        for (const w of [...this.waiters]) {
+          if (w.re.test(tail)) {
+            this.waiters.splice(this.waiters.indexOf(w), 1);
+            clearTimeout(w.timer);
+            w.resolve(this.serial);
+          }
         }
       }
       this._forward(ch);
@@ -336,11 +347,32 @@ export class MrpVm {
     for (const [name, bytes] of Object.entries(files)) {
       const stage = `__up_${i++}`;
       await this.putFile(stage, bytes);
-      const dir = name.includes('/') ? name.slice(0, name.lastIndexOf('/')) : '.';
-      const rc = await this.run(
-        `mkdir -p '${PROJ}/${dir}' && cp -f '${SHARE}/${stage}' '${PROJ}/${name}'`,
-        { timeout: 120_000 }
-      );
+      /*
+       * 文件名不能直接拼进串口命令：serial0_send 是按 charCodeAt 逐字符发的，
+       * 非 ASCII 字符（中文等）的码点 > 255，会被截断成低 8 位 ——
+       * 实测「功能机开发规范.md」会打出 0x03(^C)/0x00(NUL) 等字节，
+       * ^C 直接打断命令行、留下未闭合引号，shell 卡在 PS2 续行符，整条同步链超时。
+       * 对策：非 ASCII 名走 base64（UTF-8），guest 里 base64 -d 还原后再落盘。
+       * 单引号也不能直接进命令，所以可打印 ASCII 的判定里把它排除。
+       */
+      const safeName = /^[\x20-\x26\x28-\x7e]+$/.test(name);
+      const cmd = safeName
+        ? (() => {
+            const dir = name.includes('/') ? name.slice(0, name.lastIndexOf('/')) : '.';
+            return `mkdir -p '${PROJ}/${dir}' && cp -f '${SHARE}/${stage}' '${PROJ}/${name}'`;
+          })()
+        : (() => {
+            const b = new TextEncoder().encode(name);
+            let bin = '';
+            for (let k = 0; k < b.length; k++) bin += String.fromCharCode(b[k]);
+            const b64 = btoa(bin);
+            return (
+              `d=$(printf '%s' '${b64}' | base64 -d) && ` +
+              `mkdir -p "${PROJ}/$(dirname "$d")" && ` +
+              `cp -f '${SHARE}/${stage}' "${PROJ}/$d"`
+            );
+          })();
+      const rc = await this.run(cmd, { timeout: 120_000 });
       if (rc !== 0) throw new Error(`写入 ${name} 失败`);
     }
 

@@ -373,6 +373,8 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* 滚到头不要把滚动链传给弹窗后面的页面 */
+  overscroll-behavior: contain;
 }
 .dlg-body h2 { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
 .dlg-lead { margin: 0 0 14px; font-size: 12px; line-height: 1.65; }
@@ -430,8 +432,10 @@ body {
   list-style: none;
   margin: 0;
   padding: 0;
-  max-height: 168px;
-  overflow: auto;
+  /* 不限高、不内部滚动：清单整体展开，随 .dlg-body 一起滚动，
+     选择资源时不用在一个只显示两三行的小框里来回扒 */
+  max-height: none;
+  overflow: visible;
   border: 0.5px solid var(--line);
   border-radius: 8px;
   background: var(--bg-soft);

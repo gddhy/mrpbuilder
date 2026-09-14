@@ -293,6 +293,23 @@ function saveEditor() {
 
 let rootfsCache = null;
 
+/**
+ * 最新版模板 Makefile：镜像（rootfs.tar.gz）里烧的是打镜像那一刻的版本，
+ * 模板改动后不必重打 30MB 镜像 —— 编译时优先用站点上随仓库部署的
+ * mrp_demo/Makefile（不存在或本地 file:// 打开时静默回退镜像里的旧版）。
+ */
+let templateMakefileCache;
+async function getTemplateMakefile() {
+  if (templateMakefileCache !== undefined) return templateMakefileCache;
+  try {
+    const r = await fetch(new URL('../mrp_demo/Makefile', import.meta.url), { cache: 'no-store' });
+    templateMakefileCache = r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+  } catch {
+    templateMakefileCache = null;
+  }
+  return templateMakefileCache;
+}
+
 /** sha256 → hex。非安全上下文（file:// 或局域网 http）没有 crypto.subtle，返回 null */
 async function sha256Hex(bytes) {
   if (!globalThis.crypto?.subtle) return null;
@@ -456,8 +473,15 @@ async function build() {
   writeLine(`\n===== 开始编译 ${app} =====`);
 
   try {
+    const files = Object.fromEntries(state.overrides);
+    // 用户没自带 Makefile 时，注入站点上最新的模板 Makefile（镜像里可能是旧版）
+    if (!files['Makefile']) {
+      const mk = await getTemplateMakefile();
+      if (mk) files['Makefile'] = mk;
+    }
+
     const res = await state.vm.build({
-      files: Object.fromEntries(state.overrides),
+      files,
       app,
       target,
       extra,
@@ -824,6 +848,39 @@ function openPackOverlay() {
 function closePackOverlay() {
   el.packOverlay.classList.remove('show');
 }
+
+/**
+ * 滚轮兜底：正常浏览器里 .dlg-body（overflow:auto）天生响应鼠标滚轮，
+ * 但部分宿主环境（预览 iframe 等）会把 wheel 事件吃掉，表现为电脑端
+ * 只能拖滚动条、滚轮无反应（手机端触摸不受影响）。这里手动接管：
+ * 指针在弹窗上时把 deltaY 落到 .dlg-body 的 scrollTop 上。
+ * 内部还有自己可滚的区域（如「介绍」textarea）且没滚到头时先放行给它。
+ */
+el.packOverlay.addEventListener('wheel', (e) => {
+  if (!e.deltaY) return;
+  const dlg = e.target instanceof Element && e.target.closest('.dlg');
+  if (!dlg) return; // 指针在遮罩上，不接管
+  const body = dlg.querySelector('.dlg-body');
+  if (!body) return;
+  // 逐层向上找事件目标与 .dlg-body 之间有没有「自己还能滚」的元素
+  let node = e.target;
+  while (node instanceof Element && node !== body) {
+    if (node.scrollHeight > node.clientHeight + 1) {
+      const oy = getComputedStyle(node).overflowY;
+      if (oy === 'auto' || oy === 'scroll') {
+        const atTop = node.scrollTop <= 0;
+        const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 1;
+        if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+      }
+    }
+    node = node.parentElement;
+  }
+  // Firefox 的滚轮是行单位（deltaMode=1），换算成像素
+  const step = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+  const before = body.scrollTop;
+  body.scrollTop = before + step;
+  if (body.scrollTop !== before) e.preventDefault(); // 确实滚动了才拦默认行为
+}, { passive: false });
 
 /**
  * 环境自检：程序化 focus 后 activeElement 应该是输入框。

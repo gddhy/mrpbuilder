@@ -13,9 +13,18 @@ EXTRA   ?=
 # 注意 mrc_android.c 虽然叫 android，但 #ifdef C_RUN 之外的那个分支才是真机路径，
 # 而 mrc_readFileFromAssets() 全工程只有它实现（mrc_graphics.c 依赖它），
 # 所以不能排除，否则链接期报 undefined reference to `mrc_readFileFromAssets'。
-SRCS    := $(wildcard src/*.c)
+#
+# 除 src/ 外，工程还可能有别的源码目录（例：dsm_gm 的 info/，原作者 build.bat
+# 里就是 `main.c info/ src/`，mrpinfo.h/mrpinfo.c 都在 info/ 下）——
+# 这里自动发现所有含 .c 的子目录一起编译；含 .h 的目录（可能与 .c 同目录，
+# 也可能独立存放，比如 include/）一律加入头文件搜索路径；
+# 资源/壳/产物目录排除。
+EXCLUDE_DIRS := lib/ assets/ temp/ build/ build_output/ out/
+SRC_DIRS := $(sort $(filter-out $(EXCLUDE_DIRS),$(dir $(wildcard */*.c))))
+INC_DIRS := $(sort $(SRC_DIRS) $(filter-out $(EXCLUDE_DIRS),$(dir $(wildcard */*.h))))
+SRCS     := $(foreach d,$(SRC_DIRS),$(wildcard $(d)*.c))
 
-INCLUDES := -Isrc
+INCLUDES := $(foreach d,$(INC_DIRS),-I$(patsubst %/,%,$(d)))
 OPT      := -O2
 WARN     := -Wall -Wno-implicit-function-declaration -Wno-implicit-int -Wno-builtin-declaration-mismatch
 

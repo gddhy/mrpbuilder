@@ -20,8 +20,8 @@
   },
   "kernel": "buildroot-bzimage68.bin",
   "rootfs_bytes": 105823127,
-  "rootfs_tar_bytes": 32128987,
-  "rootfs_tar_sha256": "38e1b96a72bf40b2bb59ba61db434545d776afed71f789b9cb548732a7676814",
+  "rootfs_tar_bytes": 32129016,
+  "rootfs_tar_sha256": "fd172d08e77a2275905f17df97a02e601514d1f9339d43908b1b822974835c4b",
   "template": "mrp_demo",
-  "built": "2026-09-14T16:20:15"
+  "built": "2026-09-14T21:40:10"
 }
