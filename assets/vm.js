@@ -13,7 +13,7 @@
  *   所以不冲突），再用 LD_LIBRARY_PATH 指到解压出来的 glibc。
  */
 
-import { V86 } from './v86/libv86.mjs';
+import { V86 } from './v86/libv86.js';
 import { isGzip, looksLikeTar, gzipBytes, fmtBytes } from './bytes.js';
 
 export const SHARE = '/mnt';           // 9p 挂载点（宿主 <-> 虚拟机）

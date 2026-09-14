@@ -32,7 +32,7 @@ function need(p, hint) {
 const kernelPath = need(path.join(IMGDIR, 'vmlinuz.bin'), '请先运行：python tools/make-image.py');
 const rootfsPath = need(path.join(IMGDIR, 'rootfs.tar.gz'), '请先运行：python tools/make-image.py');
 
-const mod = await import(pathToFileURL(path.join(V86DIR, 'libv86.mjs')).href);
+const mod = await import(pathToFileURL(path.join(V86DIR, 'libv86.js')).href);
 const { MrpVm } = await import(pathToFileURL(path.join(ROOT, 'assets', 'vm.js')).href);
 void mod; // v86 由 vm.js 内部导入
 

@@ -36,7 +36,7 @@ v86 只支持 32 位 guest，而 **ARM 官方不提供 32 位 Linux 版工具链
 │                 │                                                  │
 │                 │  assets/vm.js  (MrpVm，浏览器与 Node 共用)        │
 │                 ▼                                                  │
-│  v86 (libv86.mjs + v86.wasm)                                       │
+│  v86 (libv86.js + v86.wasm)                                       │
 │  ┌─ 32 位 Linux（内核自带 rootfs，Buildroot + uClibc 6.8.12）────┐  │
 │  │  /mnt            ← 9p 共享目录（宿主读写）                    │  │
 │  │  /opt/tc         ← 解压出来的工具链（glibc + arm-none-eabi）  │  │
@@ -89,7 +89,7 @@ assets/
   bytes.js                  gzip / tar 格式判定与压缩（打包器和镜像安装共用）
   style.css
   v86/                      v86 运行时（本地化，BSD-2-Clause）
-    libv86.mjs  v86.wasm  v86-fallback.wasm
+    libv86.js  v86.wasm  v86-fallback.wasm
     bios/seabios.bin  bios/vgabios.bin
   image/                    虚拟机镜像（由 tools/make-image.py 生成）
     vmlinuz.bin             内核（10 MiB）
