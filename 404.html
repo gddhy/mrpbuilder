@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>页面不存在 · MRP 纯前端编译环境</title>
+<!-- GitHub Pages / Cloudflare Pages 对任意未命中路径都回退到本页，
+     且 GitHub Pages 的项目站部署在 /仓库名/ 子路径下 —— 跳转目标不能写死 /，
+     也不能简单取"当前目录"（深路径 404 时会算错）。
+     做法：从当前目录逐级向上 HEAD 探测 index.html，第一个命中的就是应用根；
+     全部失败则回退 /。探测完成后再开始 3 秒倒计时。 -->
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f6f5f2;
+    color: #2c2c2a;
+  }
+  .card { text-align: center; padding: 24px; }
+  .code { font-size: 64px; font-weight: 700; color: #b0885a; margin: 0; }
+  p { color: #6b6a66; margin: 12px 0 0; font-size: 14px; line-height: 1.7; }
+  a { color: #2f6f3f; }
+  .bar { display: inline-block; height: 3px; background: #b0885a; width: 100%;
+         transform-origin: left; animation: shrink 3s linear forwards; margin-top: 16px; }
+  @keyframes shrink { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="code">404</p>
+    <p>页面不存在或已被移动。<br><span id="s">3</span> 秒后自动返回首页（<a id="home" href="/">立即返回</a>）</p>
+    <div class="bar"></div>
+  </div>
+  <script>
+    (function () {
+      var MAX_UP = 5; // 最多向上探测 5 级，足够覆盖项目站 /用户名.github.io/仓库/a/b/c 的情况
+
+      function dirOf(pathname) {
+        return pathname.replace(/[^/]*$/, '') || '/';
+      }
+
+      function parentOf(dir) {
+        var p = dir.replace(/\/[^/]*\/$/, '/');
+        return p === dir ? null : p;
+      }
+
+      // 从当前目录向上找 index.html 能响应（HEAD 200）的那一级
+      function findBase(dir, tries) {
+        if (dir === null || tries > MAX_UP) return Promise.resolve('/');
+        return fetch(dir + 'index.html', { method: 'HEAD' })
+          .then(function (r) {
+            if (r.ok) return dir;
+            return findBase(parentOf(dir), tries + 1);
+          })
+          .catch(function () { return findBase(parentOf(dir), tries + 1); });
+      }
+
+      function startCountdown(base) {
+        document.getElementById('home').href = base;
+        var meta = document.createElement('meta');
+        meta.httpEquiv = 'refresh';
+        meta.content = '3; url=' + base;
+        document.head.appendChild(meta);
+
+        var left = 3;
+        var el = document.getElementById('s');
+        var t = setInterval(function () {
+          left -= 1;
+          if (el) el.textContent = left;
+          if (left <= 0) { clearInterval(t); location.replace(base); }
+        }, 1000);
+      }
+
+      findBase(dirOf(location.pathname), 1).then(startCountdown);
+    })();
+  </script>
+</body>
+</html>

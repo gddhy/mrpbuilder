@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MRP 纯前端编译环境 · v86 + arm-none-eabi-gcc</title>
+<link rel="stylesheet" href="assets/style.css?v=20260915b">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="dot" id="statusDot" data-state="off"></span>
+    <h1>MRP 纯前端编译环境</h1>
+  </div>
+  <div class="bar-actions">
+    <span class="status" id="statusText">环境未启动</span>
+    <button id="btnBoot" class="btn">启动编译环境</button>
+    <button id="btnBuild" class="btn primary" disabled>编译</button>
+    <button id="btnDownload" class="btn" disabled>下载 bin.elf</button>
+    <button id="btnPack" class="btn" disabled>打包 .mrp</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="pane">
+    <div class="pane-head">
+      <h2>工程文件</h2>
+      <div class="pane-head-actions">
+        <label class="btn small">
+          选择文件
+          <input type="file" id="fileInput" multiple hidden>
+        </label>
+        <a class="btn small" href="mrp_demo.zip" download="mrp_demo.zip"
+          title="下载内置示例工程的源码包（zip），可改完再拖回来">下载demo</a>
+        <button id="btnReset" class="btn small">恢复模板</button>
+      </div>
+    </div>
+
+    <div class="filebar">
+      <ul id="fileList" class="filelist"></ul>
+    </div>
+
+    <div class="editor-wrap">
+      <textarea id="editor" spellcheck="false" wrap="off"
+        placeholder="在此直接编辑源码，或从左边选择文件"></textarea>
+      <div class="editor-hint" id="editorHint">未选择文件</div>
+    </div>
+
+    <div id="drop" class="drop">
+      把 .c / .h / 资源文件拖到这里，或点「选择文件」
+      <br><span class="muted">同名文件会覆盖镜像内置模板</span>
+    </div>
+
+    <details class="opts" open>
+      <summary>编译选项</summary>
+      <div class="opt-row">
+        <label>入口源文件 <input id="optApp" type="text" value="helloworld.c"></label>
+      </div>
+      <div class="opt-row">
+        <label>make 目标 <span class="opt-fixed">bin.elf</span>
+          <span class="opt-note">固定值，MRP 壳按这个名字加载产物</span></label>
+      </div>
+      <div class="opt-row">
+        <label>额外参数 <input id="optExtra" type="text" placeholder="例如 -O0"></label>
+      </div>
+    </details>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <h2>编译输出</h2>
+      <div class="pane-head-actions">
+        <span class="muted" id="phase">—</span>
+        <button id="btnCopyErrors" class="btn small" title="只提取报错行（含 undefined reference / error / ld: 等），方便贴给别人排查">复制错误</button>
+        <button id="btnCopyLog" class="btn small" title="复制完整日志">复制日志</button>
+        <button id="btnClear" class="btn small">清空</button>
+      </div>
+    </div>
+    <pre id="console" class="console" aria-live="polite" tabindex="0"
+      title="日志可选中复制：Ctrl/Cmd+A 全选，或点右上角「复制日志 / 复制错误」"></pre>
+  </section>
+
+</main>
+
+<div id="hidden" style="display:none"></div>
+
+<div id="packOverlay" class="overlay">
+  <div class="dlg" role="dialog" aria-modal="true" aria-label="打包为 .mrp">
+  <div class="dlg-body">
+    <h2>打包为 .mrp</h2>
+    <p class="muted dlg-lead">
+      把 <code>start.mr</code> + <code>bin.elf</code> + 资源 + <code>cfunction.ext</code>
+      封装成一个可放到功能机上运行的 .mrp。所有文本字段按 <b>GBK</b> 编码，超长会自动截断。
+    </p>
+    <p id="pkEnvHint" class="hint" style="display:none; color: var(--err);"></p>
+
+    <div class="field-grid">
+      <label>显示名
+        <input id="pkDisplay" type="text" value="我的应用">
+        <span class="hint" id="pkDisplayHint"></span>
+      </label>
+      <label>内部名
+        <input id="pkFileName" type="text" value="mrp_demo.mrp">
+        <span class="hint" id="pkFileNameHint"></span>
+      </label>
+      <label>appid
+        <input id="pkAppid" type="number" value="30001" min="0" step="1">
+        <span class="hint">整数，自定义应用的取值区间见开发规范</span>
+      </label>
+      <label>版本
+        <input id="pkVersion" type="number" value="1" min="0" step="1">
+        <span class="hint">整数</span>
+      </label>
+      <label class="wide">开发者
+        <input id="pkVendor" type="text" value="AI Studio">
+        <span class="hint" id="pkVendorHint"></span>
+      </label>
+      <label class="wide">介绍
+        <textarea id="pkDesc" rows="2" placeholder="一句话说明这个应用"></textarea>
+        <span class="hint" id="pkDescHint"></span>
+      </label>
+    </div>
+
+    <details class="opts">
+      <summary>高级选项</summary>
+      <div class="field-grid">
+        <label>授权串 authStr
+          <input id="pkAuth" type="text" value="ea50027c8">
+          <span class="hint">取自你现有可运行 mrp 的值，一般不用改</span>
+        </label>
+        <label>flag
+          <input id="pkFlag" type="number" value="7" min="0" step="1">
+          <span class="hint">7 = 可见 + CPU 3 + start 启动</span>
+        </label>
+        <label>屏宽
+          <input id="pkSw" type="number" value="0" min="0" step="1">
+        </label>
+        <label>屏高
+          <input id="pkSh" type="number" value="0" min="0" step="1">
+        </label>
+      </div>
+    </details>
+
+    <h3 class="dlg-h3">打包清单</h3>
+    <p class="muted">顺序固定为 <code>start.mr → bin.elf → 资源 → cfunction.ext</code>；
+      资源部分可勾选。每个文件都会单独 gzip 后存入 .mrp（与真实产物一致）。</p>
+    <ul id="packList" class="packlist"></ul>
+
+    <div class="dlg-actions">
+      <span class="muted" id="packNote"></span>
+      <button id="btnPackCancel" class="btn" type="button">取消</button>
+      <button id="btnPackGo" class="btn primary" type="button">生成并下载 .mrp</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="assets/app.js?v=20260915c"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# 构建中间产物
+.build/
+
+# AI 工作区日志（含内网地址等，绝不入库）
+.workbuddy/
+
+# 编译产物
+mrp_demo/bin.elf
+mrp_demo/*.o
+
+# 命令行打包器（tools/pack-demo.mjs）的输出
+dist/
+
+# 编辑器
+*.swp
+.vscode/
+.idea/

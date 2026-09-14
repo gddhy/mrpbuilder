@@ -1,0 +1,478 @@
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f6f6f4;
+  --bg-sunken: #f1efe8;
+  --line: rgba(0, 0, 0, 0.14);
+  --line-strong: rgba(0, 0, 0, 0.28);
+  --text: #1f1f1e;
+  --text-soft: #5f5e5a;
+  --text-faint: #8a8880;
+  --accent: #185fa5;
+  --accent-soft: #e6f1fb;
+  --ok: #0f6e56;
+  --warn: #854f0b;
+  --err: #a32d2d;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 顶栏 ---------- */
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 0.5px solid var(--line);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.brand { display: flex; align-items: center; gap: 8px; }
+
+.brand h1 {
+  font-size: 15px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex: 0 0 auto;
+}
+.dot[data-state="boot"] { background: var(--warn); }
+.dot[data-state="ready"] { background: var(--ok); }
+.dot[data-state="err"] { background: var(--err); }
+
+.bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.status {
+  color: var(--text-soft);
+  font-size: 12px;
+  margin-right: 4px;
+}
+
+/* ---------- 按钮 ---------- */
+
+.btn {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 0.5px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+  /* a.btn（下载demo）这类链接型按钮要压掉浏览器默认的下划线 */
+  text-decoration: none;
+}
+.btn:hover:not(:disabled) { background: var(--bg-soft); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.btn.small { padding: 3px 9px; }
+
+/* ---------- 布局 ---------- */
+
+.layout {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  /* 行必须 minmax(0,1fr)：裸 1fr 的最小值是 auto，「编译选项」展开后内容
+     变高会把这一行撑出视口、直接压到下面「编译输出」栏上（竖屏实测踩到）。
+     minmax(0,1fr) 强制两行严格各占一半；配合 .pane 内部滚动兜底。 */
+  .layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .pane { overflow: auto; }
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  padding: 12px 16px 16px;
+}
+.pane + .pane { border-left: 0.5px solid var(--line); }
+@media (max-width: 900px) {
+  .pane + .pane { border-left: none; border-top: 0.5px solid var(--line); }
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+}
+.pane-head h2 {
+  font-size: 13px;
+  font-weight: 500;
+  margin: 0;
+  color: var(--text-soft);
+}
+.pane-head-actions { display: flex; align-items: center; gap: 8px; }
+
+.muted { color: var(--text-faint); font-size: 12px; }
+
+/* ---------- 文件列表 ---------- */
+
+.filebar {
+  flex: 0 0 auto;
+  border: 0.5px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  max-height: 146px;
+  overflow: auto;
+  background: var(--bg-soft);
+}
+
+.filelist {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.filelist li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.filelist li:hover { background: rgba(0, 0, 0, 0.045); }
+.filelist li[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.filelist .tag {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+.filelist .tag.new { color: var(--ok); }
+
+/* ---------- 编辑器 ---------- */
+
+.editor-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 120px;
+  position: relative;
+  border: 0.5px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+#editor {
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  tab-size: 4;
+  color: var(--text);
+  background: var(--bg);
+  white-space: pre;
+  overflow: auto;
+}
+
+.editor-hint {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-top: 0.5px solid var(--line);
+  background: var(--bg-soft);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* ---------- 拖拽区 ---------- */
+
+.drop {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 12px;
+  border: 0.5px dashed var(--line-strong);
+  border-radius: 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-soft);
+  background: var(--bg-soft);
+}
+.drop.over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---------- 选项 ---------- */
+
+.opts {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.opts summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  padding: 4px 0;
+}
+.opt-row { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.opt-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+.opt-row input {
+  font: inherit;
+  font-size: 12px;
+  font-family: var(--mono);
+  padding: 3px 7px;
+  border: 0.5px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  width: 12ch;
+}
+#optApp { width: 16ch; }
+#optExtra { width: 22ch; }
+
+/* make 目标是固定值，只展示不可编辑 */
+.opt-fixed {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  color: var(--text-soft);
+}
+.opt-note {
+  display: block;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* ---------- 控制台 ---------- */
+
+.console {
+  flex: 1 1 auto;
+  margin: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 0.5px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #2c2c2a;
+  /* 日志必须能选中复制（键盘 Ctrl/Cmd+A 也可，见 tabindex） */
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+  outline: none;
+}
+.console::selection { background: var(--accent-soft); }
+.console:focus-visible { border-color: var(--accent); }
+.btn.ok { color: var(--ok); border-color: var(--ok); }
+.console .ln-err { color: var(--err); }
+.console .ln-ok { color: var(--ok); }
+
+/* ---------- 打包对话框 ---------- */
+
+/*
+ * 这里特意不用 <dialog>。
+ * 原生 <dialog> 的模态靠"顶层渲染（top layer）+ backdrop"实现，行为依赖浏览器实现；
+ * 在嵌入式 webview / 预览面板里实测出现过「弹窗里的输入框点不进去」的问题。
+ * 改成普通覆盖层：定位、层级、显隐全部由我们自己控制，任何环境行为一致。
+ */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.35);
+}
+.overlay.show { display: flex; }
+
+.dlg {
+  border: 0.5px solid var(--line-strong);
+  border-radius: 12px;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  max-width: 620px;
+  width: calc(100vw - 32px);
+  /* 内容（表单 + 打包清单）可能比窗口还高，必须限高 + 内部滚动，
+     否则底部的按钮会被裁到可视区之外、鼠标根本点不到 —— 实测踩到过。 */
+  max-height: calc(100vh - 40px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+}
+.dlg-body {
+  padding: 18px 20px 0;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dlg-body h2 { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+.dlg-lead { margin: 0 0 14px; font-size: 12px; line-height: 1.65; }
+.dlg-h3 { font-size: 13px; font-weight: 500; margin: 16px 0 4px; color: var(--text-soft); }
+.dlg code {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg-sunken);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+}
+.field-grid > label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.field-grid > label.wide { grid-column: 1 / -1; }
+.field-grid input,
+.field-grid textarea {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  border: 0.5px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  width: 100%;
+  resize: vertical;
+  /*
+   * 这两条是保险：显式声明"一定可以点、一定可以选"。
+   * 弹窗是 <dialog> 模态（顶层渲染），有些嵌入式预览面板 /
+   * 带覆盖层的宿主环境会影响命中与文本选择，显式声明能避免被外部样式波及。
+   */
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.field-grid input:focus,
+.field-grid textarea:focus { outline: none; border-color: var(--accent); }
+/* 聚焦时给个可见的输入光标，别让人以为点不进去 */
+.field-grid input { cursor: text; }
+.field-grid .hint { font-size: 11px; color: var(--text-faint); }
+.field-grid .hint.over { color: var(--warn); }
+.field-grid .hint.bad { color: var(--err); }
+
+.packlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 168px;
+  overflow: auto;
+  border: 0.5px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+.packlist li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-bottom: 0.5px solid var(--line);
+}
+.packlist li:last-child { border-bottom: 0; }
+.packlist .idx {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  min-width: 2ch;
+}
+.packlist .nm { font-family: var(--mono); flex: 1 1 auto; word-break: break-all; }
+.packlist .sz { font-family: var(--mono); font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.packlist .sz.dup { color: var(--warn); }
+.packlist .fixed { font-size: 11px; color: var(--accent); white-space: nowrap; }
+.packlist .res-tag { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.packlist label { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; cursor: pointer; }
+.packlist li.nocheck { opacity: 1; }
+.packlist li.res-off .nm,
+.packlist li.res-off .sz { opacity: 0.45; }
+.packlist .empty { color: var(--text-faint); padding: 8px 10px; display: block; }
+
+.dlg-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+  /* 粘在对话框底部：内容再长按钮也始终可见可点 */
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 0.5px solid var(--line);
+  padding: 12px 0 16px;
+}
+.dlg-actions .muted { margin-right: auto; text-align: left; }
