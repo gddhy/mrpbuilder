@@ -115,6 +115,7 @@ tools/
   test-zip.mjs              验证 zip 读取/生成（含 Windows 反斜杠条目名归一化）
   test-pack.mjs             用两个真实 mrp 样本逐字节验证打包器
   test-bytes.mjs            验证 gzip/tar 格式判定 + 体积文案（B/KB/MB/GB）换算
+  test-meta.mjs             验证打包前的字段校验（与界面共用 mrp-pack.js 的规则）
   test-vm-queue.mjs         验证虚拟机命令串行化
   test-forward.mjs          验证串口日志的哨兵过滤
   test-errors.mjs           验证「复制错误」的报错行提取
@@ -203,6 +204,8 @@ SRC_FILE=path/to/main.c APP=main.c node tools/test-v86.mjs
 
 ```bash
 node tools/test-pack.mjs        # 打包器（含两个真实样本的逐字节往返）
+node tools/test-meta.mjs        # 打包表单字段校验（显示名/内部名/appid/版本/开发者）
+node tools/test-bytes.mjs       # gzip/tar 格式判定 + 体积文案换算
 node tools/test-vm-queue.mjs    # 虚拟机命令串行化
 node tools/test-forward.mjs     # 串口日志哨兵过滤
 node tools/test-errors.mjs      # 报错行提取

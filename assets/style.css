@@ -428,6 +428,16 @@ body {
 .field-grid .hint.over { color: var(--warn); }
 .field-grid .hint.bad { color: var(--err); }
 
+/* 校验不通过的字段：红边 + 一层浅红晕，配合底部状态行的文字说明，
+   直接指出"是哪个框填错了"。用户一改就会被 JS 摘掉。 */
+.field-grid input.bad,
+.field-grid textarea.bad {
+  border-color: var(--err);
+  box-shadow: 0 0 0 2px rgba(163, 45, 45, 0.14);
+}
+.field-grid input.bad:focus,
+.field-grid textarea.bad:focus { border-color: var(--err); }
+
 .packlist {
   list-style: none;
   margin: 0;
@@ -480,3 +490,27 @@ body {
   padding: 12px 0 16px;
 }
 .dlg-actions .muted { margin-right: auto; text-align: left; }
+
+/* 打包弹窗底部的状态行。
+   默认是灰字（.muted）说明当前状态；打包出错时加上 .err →
+   红字 + 淡红底 + 加粗，让「为什么失败」一眼就能看到。
+   恢复正常文案（共 N 个文件 …）时 JS 会去掉 .err，高亮随之消失。 */
+#packNote {
+  /* flex 子项默认不肯缩，长错误信息要能换行而不是把按钮挤出去 */
+  min-width: 0;
+  border-radius: 5px;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+#packNote.err {
+  padding: 4px 9px;
+  margin-left: -9px; /* 抵消内边距，左边缘仍与其他内容对齐 */
+  color: var(--err);
+  background: #fdeaea;
+  box-shadow: inset 0 0 0 1px rgba(163, 45, 45, 0.35);
+  font-weight: 600;
+  animation: packNoteIn 0.18s ease-out;
+}
+@keyframes packNoteIn {
+  from { opacity: 0.55; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}

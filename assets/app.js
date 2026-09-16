@@ -16,6 +16,7 @@ import {
   prepareFiles,
   isResourceCandidate,
   isBinaryName,
+  validatePackMeta,
   FLAG_DEFAULT,
 } from './mrp-pack.js';
 
@@ -611,13 +612,42 @@ async function loadShellFiles() {
   }
 }
 
+/**
+ * 写打包弹窗底部的状态行。
+ * @param {string} text
+ * @param {'info'|'err'} [tone]  err = 高亮（红字加粗 + 淡红底），用来突出"为什么失败"
+ *
+ * 所有写 packNote 的地方都必须走这里：出错后再把文案改回普通状态
+ * （比如「共 N 个文件」）时，tone 回到 info 就会顺手去掉 .err，不会留下残留高亮。
+ */
+function setPackNote(text, tone = 'info') {
+  el.packNote.textContent = text;
+  el.packNote.classList.toggle('err', tone === 'err');
+}
+
 function updatePackNote() {
   const elf = currentElf();
   const res = [...state.packRes].length;
   const total = 2 + res + 1;
-  el.packNote.textContent = elf
-    ? `共 ${total} 个文件（资源 ${res} 个）· ${elf.from} ${fmtBytes(elf.bytes.length)}`
-    : '还没有 bin.elf';
+  setPackNote(
+    elf
+      ? `共 ${total} 个文件（资源 ${res} 个）· ${elf.from} ${fmtBytes(elf.bytes.length)}`
+      : '还没有 bin.elf'
+  );
+}
+
+/**
+ * 撤掉上一次校验 / 打包留下的错误痕迹：输入框红边 + 底部提示的高亮。
+ * 两个调用点：
+ *   ① 用户改动表单里任何一处（改了就说明上一次的判定已经过期，
+ *      整体撤掉才不会有「红边还在、下面却没说明」的怪状态）
+ *   ② 每次点「生成并下载」重新校验之前
+ * 打包失败的原因在日志里仍然留着一条，不影响排查。
+ * 唯一写 packNote 的地方就是 setPackNote，所以直接看它的 class 就够了。
+ */
+function clearPackErrors() {
+  for (const f of PACK_FIELDS) f.classList.remove('bad');
+  if (el.packNote.classList.contains('err')) updatePackNote();
 }
 
 function renderPackList() {
@@ -710,7 +740,7 @@ async function openPackDialog() {
   }
   renderPackList();
   refreshPackHints();
-  el.packNote.textContent = '正在读取壳文件 …';
+  setPackNote('正在读取壳文件 …');
   openPackOverlay();
   await loadShellFiles();
   renderPackList();
@@ -721,14 +751,54 @@ function clampInt(v, fallback) {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+// ---- 打包表单校验 ----------------------------------------------------------
+// 规则本身在 assets/mrp-pack.js 的 validatePackMeta() 里（与命令行打包器共用同一份），
+// 这里只负责把返回的「字段名」映射到界面上的输入框，并给那个框加红边。
+const PACK_INPUTS = {
+  displayName: el.pkDisplay,
+  fileName: el.pkFileName,
+  appid: el.pkAppid,
+  version: el.pkVersion,
+  vendor: el.pkVendor,
+};
+const PACK_FIELDS = Object.values(PACK_INPUTS);
+
+/** 校验表单，返回 [输入框, 提示文案]；全部通过返回 null */
+function firstPackFieldError() {
+  /*
+   * type=number 的框里填了非数字（"abc"、"30001." 这种），DOM 给的 value 是**空串**，
+   * 直接交上去会误报"不能为空"（可框里明明有内容）。这里把 validity.badInput
+   * 换成一个非数字占位串，让规则自己去判成"只能是数字"，避免把文案抄成两份。
+   */
+  const numValue = (input) => (input.validity?.badInput ? 'NaN' : input.value);
+  const bad = validatePackMeta({
+    displayName: el.pkDisplay.value,
+    fileName: el.pkFileName.value,
+    appid: numValue(el.pkAppid),
+    version: numValue(el.pkVersion),
+    vendor: el.pkVendor.value,
+  });
+  return bad ? [PACK_INPUTS[bad.field], bad.message] : null;
+}
+
 async function doPack() {
-  const displayName = el.pkDisplay.value.trim();
-  if (!displayName) {
-    el.packNote.textContent = '显示名不能为空';
-    el.pkDisplay.focus();
+  clearPackErrors();
+  const bad = firstPackFieldError();
+  if (bad) {
+    const [input, message] = bad;
+    // 底部状态行高亮说"错在哪"，红边直接指出"哪个框"
+    input.classList.add('bad');
+    setPackNote(`⚠ ${message}`, 'err');
+    // 只聚焦、不全选：全选后在某些嵌入式预览面板里点击被吞掉，
+    // 高亮一直留着，鼠标就没法把光标点到想改的位置了
+    try {
+      input.focus();
+    } catch {}
     return;
   }
-  const fileName = el.pkFileName.value.trim() || 'app.mrp';
+
+  const displayName = el.pkDisplay.value.trim();
+  const fileName = el.pkFileName.value.trim();
   const meta = {
     fileName,
     displayName,
@@ -743,7 +813,7 @@ async function doPack() {
   };
 
   el.btnPackGo.disabled = true;
-  el.packNote.textContent = '读取文件 …';
+  setPackNote('读取文件 …');
   try {
     const elf = currentElf();
     if (!elf) throw new Error('还没有 bin.elf');
@@ -762,9 +832,9 @@ async function doPack() {
     const dups = [...seen].filter(([, c]) => c > 1).map(([n]) => n);
     if (dups.length) throw new Error(`打包清单里有重名文件：${dups.join('、')}（mrp 内部按文件名索引）`);
 
-    el.packNote.textContent = '压缩中 …';
+    setPackNote('压缩中 …');
     const prepared = await prepareFiles(raw, (i, total, name) => {
-      el.packNote.textContent = `压缩中 ${i}/${total}：${name}`;
+      setPackNote(`压缩中 ${i}/${total}：${name}`);
     });
 
     const { bytes, entries } = packMrp({ ...meta, files: prepared });
@@ -803,11 +873,11 @@ async function doPack() {
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
     writeLine(`\n✓ 已生成 ${outName}（${fmtBytes(bytes.length)}），开始下载`);
     closePackOverlay();
-    el.packNote.textContent = '';
+    // 回到普通文案（tone=info）→ 顺手清掉上一次失败留下的高亮
     updatePackNote();
   } catch (e) {
     writeLine(`\n✗ 打包失败：${e.message}`);
-    el.packNote.textContent = `打包失败：${e.message}`;
+    setPackNote(`⚠ 打包失败：${e.message}`, 'err');
   } finally {
     el.btnPackGo.disabled = false;
     el.console.scrollTop = el.console.scrollHeight;
@@ -826,8 +896,18 @@ el.btnPack.onclick = openPackDialog;
 el.btnPackCancel.onclick = closePackOverlay;
 el.btnPackGo.onclick = doPack;
 
-for (const input of [el.pkDisplay, el.pkFileName, el.pkVendor, el.pkDesc]) {
-  input.addEventListener('input', refreshPackHints);
+for (const input of [...PACK_FIELDS, el.pkDesc]) {
+  input.addEventListener('input', () => {
+    // 改了就撤掉上一次的错误痕迹（红边 + 底部提示）
+    clearPackErrors();
+    refreshPackHints();
+  });
+}
+
+// 高级选项（authStr / flag / 屏宽高）不参与字段校验，也没 GBK 提示，
+// 但改了同样应该撤掉底部那条错误提示
+for (const input of [el.pkAuth, el.pkFlag, el.pkSw, el.pkSh]) {
+  input.addEventListener('input', clearPackErrors);
 }
 
 // 点遮罩关闭对话框（<dialog> 默认不响应）
@@ -835,9 +915,10 @@ function openPackOverlay() {
   el.packOverlay.classList.add('show');
   // 有些嵌入式预览面板会拦截"点击 → 聚焦"这条事件链（表现为输入框点不进、
   // 光标出不来），但程序化 focus() 不经过事件链，不受影响。
-  // 自动把光标放进第一个输入框，用户打开弹窗即可直接打字。
+  // 只把光标放进去，**不做全选** —— 全选后如果点击又被宿主吞掉，
+  // 高亮会一直挂着，鼠标就再也点不到想改的位置（用户反馈过这个问题）。
   setTimeout(() => {
-    try { el.pkDisplay.focus(); el.pkDisplay.select(); } catch {}
+    try { el.pkDisplay.focus(); } catch {}
     checkOverlayInputEnv();
   }, 80);
 }

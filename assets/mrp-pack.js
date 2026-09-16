@@ -50,6 +50,61 @@ export const MRP_LIMITS = {
 };
 
 // ---------------------------------------------------------------------------
+// 打包前的字段校验（浏览器界面与命令行共用同一套规则）
+// ---------------------------------------------------------------------------
+// 这几个字段都要写进 .mrp 的固定头，填错了打出来的包在手机上就是异常表现，
+// 所以规则放在这里，界面和命令行都引用它，不会各写一套。
+
+/** 内部名允许的字符：英文字母、数字、下划线、短横线、点 */
+const NAME_CHAR_OK = /^[A-Za-z0-9_.-]$/;
+
+/**
+ * 校验打包元信息里「填错就会打出坏包」的字段。
+ *
+ * @param {{displayName?: any, fileName?: any, appid?: any, version?: any, vendor?: any}} meta
+ * @returns {{field: string, message: string} | null} 第一条错误；全部通过返回 null
+ *
+ * 规则：
+ *   displayName  不允许为空
+ *   fileName     不允许为空；只能是英文（可带数字/下划线/短横线/点）；必须以 .mrp 结尾
+ *   appid        不允许为空；只能是 0 或正整数
+ *   version      不允许为空；只能是 0 或正整数
+ *   vendor       不允许为空
+ */
+export function validatePackMeta(meta = {}) {
+  const text = (v) => String(v ?? '').trim();
+
+  if (!text(meta.displayName)) return { field: 'displayName', message: '显示名不能为空' };
+
+  const name = text(meta.fileName);
+  if (!name) return { field: 'fileName', message: '内部名不能为空，例如 myapp.mrp' };
+  // 先挑非法字符再判后缀：中文名（例：我的应用.mrp）该提示"要英文"而不是"要 .mrp 结尾"
+  const badChars = [...new Set([...name].filter((c) => !NAME_CHAR_OK.test(c)))];
+  if (badChars.length) {
+    return {
+      field: 'fileName',
+      message: `内部名只能用英文和数字（不能含「${badChars.join('')}」），例如 my_app.mrp`,
+    };
+  }
+  if (!/\.mrp$/i.test(name)) {
+    const base = name.replace(/\.[A-Za-z0-9]+$/, '') || name;
+    return { field: 'fileName', message: `内部名必须以 .mrp 结尾，例如 ${base}.mrp` };
+  }
+
+  const appid = text(meta.appid);
+  if (!appid) return { field: 'appid', message: 'appid 不能为空' };
+  if (!/^\d+$/.test(appid)) return { field: 'appid', message: 'appid 只能是数字（0 或正整数）' };
+
+  const version = text(meta.version);
+  if (!version) return { field: 'version', message: '版本不能为空' };
+  if (!/^\d+$/.test(version)) return { field: 'version', message: '版本只能是数字（0 或正整数）' };
+
+  if (!text(meta.vendor)) return { field: 'vendor', message: '开发者不能为空' };
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // 文件分类（浏览器界面与命令行打包器共用同一套规则，避免两边不一致）
 // ---------------------------------------------------------------------------
 
