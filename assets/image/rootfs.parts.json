@@ -1,7 +1,7 @@
 {
   "file": "rootfs.tar.gz",
-  "size": 32129016,
-  "sha256": "fd172d08e77a2275905f17df97a02e601514d1f9339d43908b1b822974835c4b",
+  "size": 32134639,
+  "sha256": "55268c1862afece6da44eb38774f84c73352788f611935e456838775e3f93c28",
   "partBytes": 20971520,
   "parts": [
     {
@@ -10,7 +10,7 @@
     },
     {
       "name": "rootfs.tar.gz.part01",
-      "size": 11157496
+      "size": 11163119
     }
   ]
 }

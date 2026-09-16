@@ -3,6 +3,11 @@
 在浏览器里用 **arm-none-eabi-gcc** 编译功能机（MT6225 / 6235 / 6250 / 6276 等）的 MRP 程序，
 产出 `bin.elf`。**不需要后端、不需要装任何本地工具**，任何有浏览器的设备打开就能用。
 
+> 产物要能**在真机上跑**，编译参数里必须带 `-ffixed-r9 -ffixed-r10`：
+> MRP 壳是 APCS 编译的，它拿 r9/r10 当静态基址和栈限，而 GCC 在 `-fPIC` 下默认也想用这两个
+> 寄存器 —— 抢起来的症状就是「**模拟器里正常、MTK 真机卡在启动页**」。
+> 内置模板 Makefile 已经带上了，详见「MRP 编译的硬约束」。
+
 ---
 
 ## 为什么要在浏览器里跑一台 Linux
@@ -216,18 +221,51 @@ MRP 壳里的 ELF 加载器（`loader/elfloader.c` 的 `el_applyrel`）**只处�
 这就是社区反复提到的「GOT 表问题」：如果链接进 C 库或软浮点库，就会带出
 `GLOB_DAT` / `JUMP_SLOT` 重定位，加载器直接拒绝。
 
-所以编译参数必须是这样：
+### 2) r9 / r10 必须让给壳
+
+MRP 壳是 APCS 编译的，它自己拿 **r9(sb)** 当静态基址、**r10(sl)** 当栈限；
+而 GCC 在 `-fPIC` 下默认也会把 r9 当 GOT/静态基址、把 r10 当栈限。
+两边抢同一对寄存器，于是出现那个很典型的症状：
+
+- **安卓模拟器 / v86 里跑得好好的** —— 壳那条路径碰巧没被踩到；
+- **MTK 真机（6225 / 6235 / 6250）一进启动页就死住** —— 卡在启动页，无报错、无日志。
+
+所以编译参数里**必须**有 `-ffixed-r9 -ffixed-r10`，让编译器彻底不碰这两个寄存器。
+
+同一份 `helloworld.c` + `src/`（19 个 .c），加上这一对开关前后对比：
+
+| | 旧参数（`-O2`，无 `-ffixed`） | 新参数（见下） |
+|---|---|---|
+| 反汇编里出现 r9/r10 的行数 | **702** | **0** |
+| 产物大小 | 259,124 字节 | 14,640 字节 |
+| 动态重定位 | 89 条，全 `R_ARM_RELATIVE` | 31 条，全 `R_ARM_RELATIVE` |
+
+`make check` 会把 r9/r10 占用行数直接打出来，不是 0 就说明这个开关没生效。
+
+### 完整编译参数
 
 ```makefile
-arm-none-eabi-gcc -o bin.elf <sources> \
-    -marm -march=armv5te -fPIC \
-    -nostdlib -nostartfiles -pie -Wl,--entry=_start
+CODEFLAGS := -marm -march=armv5te -mfloat-abi=soft -fPIC -g0 \
+             -ffixed-r9 -ffixed-r10 \
+             -ffunction-sections -fdata-sections \
+             -fno-common -fshort-enums \
+             -fno-tree-loop-distribute-patterns
+LDFLAGS   := -nostdlib -nostartfiles -pie -Wl,--entry=_start \
+             -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug
 ```
 
-`-nostdlib -nostartfiles` 是关键：不链接任何库，符号全部内部解析，
-动态重定位就只剩 `R_ARM_RELATIVE`。
+这套与 **TinalIDE**（`Mrp项目-TinalIDE`）里跑通真机的 Makefile 对齐；逐条为什么这么写，
+见 `mrp_demo/Makefile` 顶部的注释。三点值得单独说明：
 
-`tools/check-elf.py` 专门检查这件事，编译后建议跑一次。
+- **`-nostdlib -nostartfiles` 是关键**：不链接任何库，符号全部内部解析，
+  动态重定位就只剩 `R_ARM_RELATIVE`。
+  **故意不加** `--specs=nano.specs -lc -lm` —— 链进 libc 会带出 GOT / `GLOB_DAT`，
+  而且镜像里本来也没装 `libnewlib-arm-none-eabi`，`-lc` 会直接 `cannot find -lc`。
+- **`-Wl,--gc-sections` 才是真正减体积的那一个**（demo 从 ~259KB 降到 ~15KB）。
+- `-Wl,--strip-all` / `-Wl,--strip-debug` 实测在 GNU ld 上是**空操作**
+  （加与不加产物字节数完全一样），保留只是为了跟 TinalIDE 的写法一致、也无副作用。
+
+`tools/check-elf.py` 专门检查重定位这件事，编译后建议跑一次。
 
 ### 但 libgcc 必须手动链进来
 
@@ -257,6 +295,10 @@ Debian 把 newlib 拆成了两个包：
 社区验证过的组合是 **arm-none-eabi-gcc 9.3.1**。本项目用的是 Debian bookworm 的
 **12.2.rel1**（i386 版里较新的稳定版本）。如果产物在真机上有异常，可以换 Debian
 历史版本（pool 里有 `8-2019-q3-1+b1_i386.deb`，更接近 9.3.1）。
+
+> ⚠️ 但**换版本之前先确认 r9/r10 那对开关在**（见「MRP 编译的硬约束」）。
+> 「模拟器能跑、真机卡启动页」这个现象**不是**版本问题，是 `-ffixed-r9 -ffixed-r10` 没加；
+> 换工具链版本治不了它。
 
 ---
 
@@ -337,8 +379,9 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 | 编译完整工程（`helloworld.c` + `src/` 下 19 个 .c，约 1.3MB 源码） | ✅ 全部编译通过，仅 warning |
 | 软浮点（`__aeabi_*`）链接 | ✅ 正确链入 libgcc |
 | 产物格式 | ✅ ARM 静态 PIE（ET_DYN），无 `DT_NEEDED` |
-| 动态重定位 | ✅ **89 条全部是 `R_ARM_RELATIVE`** |
-| 9p 取回产物 | ✅ 266,576 字节（`-O2` 完整构建，`tools/check-elf.py` 判定通过） |
+| 动态重定位 | ✅ **31 条全部是 `R_ARM_RELATIVE`** |
+| r9 / r10 占用 | ✅ **反汇编里 0 行**（`-ffixed-r9 -ffixed-r10` 生效） |
+| 9p 取回产物 | ✅ **14,664 字节**（`-Os` + `--gc-sections` 完整构建，`tools/check-elf.py` 判定通过） |
 
 自检产物（`make selftest`，符号全部解析干净）经 `check-elf.py` 判定为 **0 条动态重定位**，
 完全满足 MRP 加载器要求 —— 说明编译器 / 链接器 / flags 这条链是可靠的。
@@ -349,7 +392,7 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 |---|---|
 | 页面启动虚拟机 + 装工具链 | ✅ 点「启动编译环境」后约 **20 秒**到「环境就绪」 |
 | 读到内置模板 | ✅ 50 个文件（含 `src/mrp_compat.c`） |
-| 点「编译」跑完整 `-O2` 构建 | ✅ **编译成功**，与 Node 侧结果一致（**266,576 字节**） |
+| 点「编译」跑完整 `-Os` 构建 | ✅ **编译成功**，与 Node 侧结果一致（**14,664 字节**） |
 | 「下载 bin.elf」 | ✅ 按钮变为可用 |
 | 输出框文本选择 | ✅ `user-select: text`（`Ctrl/Cmd+A` 可全选） |
 | 「复制错误」/「复制日志」 | ✅ 前者只留报错行 + `in function` 上下文，过滤 warning 与普通输出 |
@@ -449,7 +492,7 @@ part00 的"期望大小"于是等于**整个文件的大小**，浏览器下载 
 
 | 符号 | 出现位置 | 根因 |
 |---|---|---|
-| `memset`、`memmove`×2、`strlen` | `display_object.c`、`mrc_win.c`、`mrc_sound.c` | GCC 在 `-O2` 下把**手写循环**识别成标准库调用后直接发调用指令（`-ftree-loop-distribute-patterns`）。手里写 `while(*p++) len++;` 也会被换成 `strlen` |
+| `memset`、`memmove`×2、`strlen` | `display_object.c`、`mrc_win.c`、`mrc_sound.c` | GCC 一开优化（`-O2` / `-O3`）就把**手写循环**识别成标准库调用后直接发调用指令（`-ftree-loop-distribute-patterns`）。手里写 `while(*p++) len++;` 也会被换成 `strlen` |
 | `sqrt`×3、`atan2` | `bitmap.c` | 直接 `#include <math.h>`，而 `-nostdlib` 不链接 libm |
 | `abs` | `mrc_base.c`（`mrc_drawLine`） | 同上的内联决策问题（见下） |
 | `mrc_getSysMem`、`mrc_getMemoryRemain` | `mrc_ram.c` | 全工程**只有声明、没有实现**（armcc 时代由厂商 `.lib` 提供） |
@@ -491,7 +534,8 @@ part00 的"期望大小"于是等于**整个文件的大小**，浏览器下载 
 - `tools/make-image.py` 重新解包时若删不掉旧 `rootfs`，会改名为 `.build/rootfs.stale-*`，可手动清理
 - 语言标准：工程要求 C99，且变量必须在块首声明（见 `mrp_demo/README.md`）
 - 虚拟机内存固定 384MB，v86 会一次性分配
-- **编译耗时**：`-O2` 完整构建约 **6~7 分钟**（浏览器与 Node 实测一致，脚本约 400s）；
+- **编译耗时**：`-Os` 完整构建（含启动虚拟机 + 装工具链）**约 3 分 50 秒**
+  （`tools/test-v86.mjs` 实测 227.7s，其中真正编译约 207s）；
   临时想快一点可以在「额外参数」里填 `-O0`，大约 1 分钟
 - **`libnewlib-arm-none-eabi`（360MB 的 newlib 多版本库）没有装**，因为工程用 `-nostdlib`。
   如果需要链接 newlib 的 libc/libm，要把它加进 `TARGET_PACKAGES`，镜像会明显变大。
