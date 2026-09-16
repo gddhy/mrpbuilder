@@ -114,7 +114,7 @@ tools/
   test-v86.mjs              在 Node 里跑通整条链路，无浏览器也能验证
   test-zip.mjs              验证 zip 读取/生成（含 Windows 反斜杠条目名归一化）
   test-pack.mjs             用两个真实 mrp 样本逐字节验证打包器
-  test-bytes.mjs            验证 gzip/tar 格式判定
+  test-bytes.mjs            验证 gzip/tar 格式判定 + 体积文案（B/KB/MB/GB）换算
   test-vm-queue.mjs         验证虚拟机命令串行化
   test-forward.mjs          验证串口日志的哨兵过滤
   test-errors.mjs           验证「复制错误」的报错行提取

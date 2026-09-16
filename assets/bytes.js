@@ -45,8 +45,29 @@ export async function gzipBytes(bytes) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** 人读的大小 */
+/**
+ * 人读的体积：自动换算到最合适的单位（B / KB / MB / GB）。
+ * 只用于显示，别拿它做校验 —— 要精确字节数就用原始数字。
+ * 进制是 1024（与镜像/分段的实际口径一致），所以 1 MB = 1024 KB。
+ *   1023     → 1,023 B     （不到 1 KB 不换算）
+ *   2490     → 2.4 KB
+ *   33572    → 32.8 KB
+ *   32134639 → 30.6 MB
+ */
+const SIZE_UNITS = ['B', 'KB', 'MB', 'GB'];
 export function fmtBytes(n) {
   if (n == null) return '';
-  return n < 10240 ? `${n.toLocaleString()} B` : `${(n / 1048576).toFixed(1)} MiB`;
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < SIZE_UNITS.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  // 留 1 位小数后可能刚好顶到 1024.0（1048575 字节就是 1024.0 KB），
+  // 那样显示出来像"1024 KB"，其实该进位到下一个单位 → 再降一级
+  if (i < SIZE_UNITS.length - 1 && v.toFixed(1) === '1024.0') {
+    v /= 1024;
+    i += 1;
+  }
+  return i === 0 ? `${v.toLocaleString()} B` : `${v.toFixed(1)} ${SIZE_UNITS[i]}`;
 }

@@ -30,6 +30,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { packMrp, parseMrp, prepareFiles, isResourceCandidate, encodeGBKDetailed } = await import(
   pathToFileURL(path.join(ROOT, 'assets', 'mrp-pack.js')).href
 );
+// 体积文案与网页端共用同一份实现（assets/bytes.js）
+const { fmtBytes } = await import(pathToFileURL(path.join(ROOT, 'assets', 'bytes.js')).href);
 
 const argv = process.argv.slice(2);
 function arg(name, dflt) {
@@ -110,7 +112,7 @@ if (dups.length) {
 }
 
 console.log('打包清单（顺序固定：start.mr → bin.elf → 资源 → cfunction.ext）');
-console.log('  序号  文件名                原始大小    → gzip 后');
+console.log('  序号  文件名               原始大小     → gzip 后');
 const prepared = await prepareFiles(raw, (i, total, name) => {
   process.stdout.write(`\r  压缩中 ${i}/${total} ${name}                    `);
 });
@@ -135,7 +137,7 @@ for (const [i, e] of entries.entries()) {
   const rawLen = raw[i].data.length;
   const pct = rawLen ? `  (${((e.size / rawLen) * 100).toFixed(0)}%)` : '';
   console.log(
-    `  ${String(i + 1).padStart(3)}   ${e.name.padEnd(18)} ${String(rawLen.toLocaleString()).padStart(9)}  → ${String(e.size.toLocaleString()).padStart(9)}${pct}`
+    `  ${String(i + 1).padStart(3)}   ${e.name.padEnd(18)} ${fmtBytes(rawLen).padStart(10)}  → ${fmtBytes(e.size).padStart(10)}${pct}`
   );
 }
 
@@ -176,6 +178,6 @@ for (const [label, value, limit] of [
 
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, bytes);
-console.log(`\n✓ 已生成 ${rel(out)}（${bytes.length.toLocaleString()} 字节）`);
+console.log(`\n✓ 已生成 ${rel(out)}（${fmtBytes(bytes.length)}）`);
 console.log(`  校验：python tools/dev-inspect-mrp.py ${rel(out)}`);
 process.exit(problems.length ? 1 : 0);

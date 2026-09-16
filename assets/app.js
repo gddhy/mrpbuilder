@@ -8,6 +8,7 @@
 
 import { MrpVm } from './vm.js';
 import { unzip } from './zip.js';
+import { fmtBytes } from './bytes.js'; // 体积文案（B/KB/MB 自动换算），与命令行共用同一份
 import {
   packMrp,
   parseMrp,
@@ -338,7 +339,7 @@ async function loadRootfs() {
     return new Uint8Array(await r.arrayBuffer());
   }
 
-  writeLine(`  镜像按 ${manifest.parts.length} 个分段下载（单段上限 ${sizeText(manifest.partBytes)}）`);
+  writeLine(`  镜像按 ${manifest.parts.length} 个分段下载（单段上限 ${fmtBytes(manifest.partBytes)}）`);
   const chunks = [];
   let total = 0;
   for (let i = 0; i < manifest.parts.length; i++) {
@@ -351,7 +352,7 @@ async function loadRootfs() {
     }
     chunks.push(bytes);
     total += bytes.length;
-    writeLine(`    ${i + 1}/${manifest.parts.length}  ${part.name}  ${sizeText(bytes.length)}`);
+    writeLine(`    ${i + 1}/${manifest.parts.length}  ${part.name}  ${fmtBytes(bytes.length)}`);
   }
   if (total !== manifest.size) {
     throw new Error(`镜像拼合后大小不符：期望 ${manifest.size} 字节，实际 ${total}`);
@@ -423,7 +424,7 @@ async function boot() {
     if (!rootfsCache) {
       writeLine('正在下载工具链镜像 …');
       rootfsCache = await loadRootfs();
-      writeLine(`  收到 ${sizeText(rootfsCache.length)}`);
+      writeLine(`  收到 ${fmtBytes(rootfsCache.length)}`);
     }
 
     const info = await vm.installToolchain(rootfsCache);
@@ -431,7 +432,7 @@ async function boot() {
       // 常见于服务端给 .tar.gz 响应加了 Content-Encoding: gzip，浏览器会自动解码，
       // 结果拿到的是未压缩的 tar。installToolchain 已就地压回去，这里只做提示。
       writeLine(
-        `  ⚠ 下载到的镜像不是 gzip（被传输层透明解压过），已重新压缩为 ${sizeText(info.bytes)}`
+        `  ⚠ 下载到的镜像不是 gzip（被传输层透明解压过），已重新压缩为 ${fmtBytes(info.bytes)}`
       );
     }
     writeLine('\n✓ 工具链已装入虚拟机');
@@ -499,7 +500,7 @@ async function build() {
     el.btnPack.disabled = false;
     setPhase('ready', '编译成功');
     const b = res.artifact.bytes;
-    writeLine(`\n✓ 编译完成：${res.artifact.name}（${b.length} 字节）`);
+    writeLine(`\n✓ 编译完成：${res.artifact.name}（${fmtBytes(b.length)}）`);
     const isElf = b.length >= 4 && b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46;
     writeLine(isElf ? '  已确认为 ELF 可执行文件，可下载、可用「打包 .mrp」' : '  ⚠ 产物不是 ELF，请检查该文件');
   } catch (e) {
@@ -560,11 +561,6 @@ function refreshPackHints() {
   }
 }
 
-function sizeText(n) {
-  if (n == null) return '';
-  return n < 10240 ? `${n.toLocaleString()} B` : `${(n / 1024).toFixed(1)} KB`;
-}
-
 /**
  * 拿去打包的 bin.elf：
  * 优先用刚编译出来的产物；没有的话，看用户有没有自己上传一个 bin.elf。
@@ -620,7 +616,7 @@ function updatePackNote() {
   const res = [...state.packRes].length;
   const total = 2 + res + 1;
   el.packNote.textContent = elf
-    ? `共 ${total} 个文件（资源 ${res} 个）· ${elf.from} ${sizeText(elf.bytes.length)}`
+    ? `共 ${total} 个文件（资源 ${res} 个）· ${elf.from} ${fmtBytes(elf.bytes.length)}`
     : '还没有 bin.elf';
 }
 
@@ -658,7 +654,7 @@ function renderPackList() {
       tag.textContent = it.tag;
       const sz = document.createElement('span');
       sz.className = 'sz';
-      sz.textContent = it.size != null ? sizeText(it.size) : '';
+      sz.textContent = it.size != null ? fmtBytes(it.size) : '';
       li.append(num, nm, tag, sz);
     } else {
       const label = document.createElement('label');
@@ -785,7 +781,7 @@ async function doPack() {
       const raw0 = raw[i]?.data?.length ?? 0;
       const pct = raw0 ? ((e.size / raw0) * 100).toFixed(0) + '%' : '';
       writeLine(
-        `    ${String(i + 1).padStart(2)}  ${e.name.padEnd(18)} ${sizeText(raw0).padStart(10)} → ${sizeText(e.size).padStart(9)}${pct ? `  (${pct})` : ''}`
+        `    ${String(i + 1).padStart(2)}  ${e.name.padEnd(18)} ${fmtBytes(raw0).padStart(10)} → ${fmtBytes(e.size).padStart(10)}${pct ? `  (${pct})` : ''}`
       );
     }
     if (check.length) {
@@ -805,7 +801,7 @@ async function doPack() {
     a.download = outName;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    writeLine(`\n✓ 已生成 ${outName}（${bytes.length.toLocaleString()} 字节），开始下载`);
+    writeLine(`\n✓ 已生成 ${outName}（${fmtBytes(bytes.length)}），开始下载`);
     closePackOverlay();
     el.packNote.textContent = '';
     updatePackNote();

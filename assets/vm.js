@@ -273,8 +273,13 @@ export class MrpVm {
     const sizeTxt = new TextDecoder().decode(await this.getFile('__tcsize')).trim();
     const guestSize = Number.parseInt(sizeTxt, 10);
     if (guestSize !== payload.length) {
+      // 「对不上」的报错，两个口径都给：精确字节用于判断差多少，KB/MB 用于一眼看懂量级
+      const said = Number.isFinite(guestSize)
+        ? `${guestSize.toLocaleString()} 字节（${fmtBytes(guestSize)}）`
+        : `读不出来（wc -c 返回 "${sizeTxt}"）`;
       throw new Error(
-        `工具链镜像传输不完整：本地 ${payload.length} 字节，虚拟机里只有 ${sizeTxt} 字节`
+        `工具链镜像传输不完整：本地 ${payload.length.toLocaleString()} 字节` +
+        `（${fmtBytes(payload.length)}），虚拟机里只有 ${said}`
       );
     }
 
