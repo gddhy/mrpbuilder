@@ -42,6 +42,9 @@ const el = {
   btnCopyLog: $('btnCopyLog'),
   btnCopyErrors: $('btnCopyErrors'),
   btnPack: $('btnPack'),
+  btnHelp: $('btnHelp'),
+  btnHelpClose: $('btnHelpClose'),
+  helpOverlay: $('helpOverlay'),
   packOverlay: $('packOverlay'),
   packList: $('packList'),
   packNote: $('packNote'),
@@ -895,6 +898,8 @@ el.btnClear.onclick = clearConsole;
 el.btnPack.onclick = openPackDialog;
 el.btnPackCancel.onclick = closePackOverlay;
 el.btnPackGo.onclick = doPack;
+el.btnHelp.onclick = openHelpOverlay;
+el.btnHelpClose.onclick = closeHelpOverlay;
 
 for (const input of [...PACK_FIELDS, el.pkDesc]) {
   input.addEventListener('input', () => {
@@ -927,37 +932,61 @@ function closePackOverlay() {
 }
 
 /**
+ * 帮助弹窗。纯说明性内容、没有输入框，所以只做显隐切换：
+ * 遮罩点击 / Escape / 滚轮兜底统一由下面 attachOverlay* 那组函数接管。
+ */
+function openHelpOverlay() {
+  el.helpOverlay.classList.add('show');
+}
+function closeHelpOverlay() {
+  el.helpOverlay.classList.remove('show');
+}
+
+/** 点遮罩（而不是点弹窗本体）关闭。两个弹窗行为一致，抽出来共用 */
+function attachOverlayDismiss(overlay, close) {
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay) close();
+  });
+}
+attachOverlayDismiss(el.packOverlay, closePackOverlay);
+attachOverlayDismiss(el.helpOverlay, closeHelpOverlay);
+
+/**
  * 滚轮兜底：正常浏览器里 .dlg-body（overflow:auto）天生响应鼠标滚轮，
  * 但部分宿主环境（预览 iframe 等）会把 wheel 事件吃掉，表现为电脑端
  * 只能拖滚动条、滚轮无反应（手机端触摸不受影响）。这里手动接管：
  * 指针在弹窗上时把 deltaY 落到 .dlg-body 的 scrollTop 上。
  * 内部还有自己可滚的区域（如「介绍」textarea）且没滚到头时先放行给它。
  */
-el.packOverlay.addEventListener('wheel', (e) => {
-  if (!e.deltaY) return;
-  const dlg = e.target instanceof Element && e.target.closest('.dlg');
-  if (!dlg) return; // 指针在遮罩上，不接管
-  const body = dlg.querySelector('.dlg-body');
-  if (!body) return;
-  // 逐层向上找事件目标与 .dlg-body 之间有没有「自己还能滚」的元素
-  let node = e.target;
-  while (node instanceof Element && node !== body) {
-    if (node.scrollHeight > node.clientHeight + 1) {
-      const oy = getComputedStyle(node).overflowY;
-      if (oy === 'auto' || oy === 'scroll') {
-        const atTop = node.scrollTop <= 0;
-        const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 1;
-        if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+function attachOverlayWheel(overlay) {
+  overlay.addEventListener('wheel', (e) => {
+    if (!e.deltaY) return;
+    const dlg = e.target instanceof Element && e.target.closest('.dlg');
+    if (!dlg) return; // 指针在遮罩上，不接管
+    const body = dlg.querySelector('.dlg-body');
+    if (!body) return;
+    // 逐层向上找事件目标与 .dlg-body 之间有没有「自己还能滚」的元素
+    let node = e.target;
+    while (node instanceof Element && node !== body) {
+      if (node.scrollHeight > node.clientHeight + 1) {
+        const oy = getComputedStyle(node).overflowY;
+        if (oy === 'auto' || oy === 'scroll') {
+          const atTop = node.scrollTop <= 0;
+          const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 1;
+          if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+        }
       }
+      node = node.parentElement;
     }
-    node = node.parentElement;
-  }
-  // Firefox 的滚轮是行单位（deltaMode=1），换算成像素
-  const step = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-  const before = body.scrollTop;
-  body.scrollTop = before + step;
-  if (body.scrollTop !== before) e.preventDefault(); // 确实滚动了才拦默认行为
-}, { passive: false });
+    // Firefox 的滚轮是行单位（deltaMode=1），换算成像素
+    const step = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+    const before = body.scrollTop;
+    body.scrollTop = before + step;
+    if (body.scrollTop !== before) e.preventDefault(); // 确实滚动了才拦默认行为
+  }, { passive: false });
+}
+attachOverlayWheel(el.packOverlay);
+attachOverlayWheel(el.helpOverlay);
 
 /**
  * 环境自检：程序化 focus 后 activeElement 应该是输入框。
@@ -982,13 +1011,13 @@ el.packOverlay.querySelectorAll('input, textarea').forEach((inp) => {
   inp.addEventListener('touchstart', grab, { passive: true });
 });
 
-// 点遮罩（而不是点弹窗本体）关闭
-el.packOverlay.addEventListener('mousedown', (e) => {
-  if (e.target === el.packOverlay) closePackOverlay();
-});
-// Escape 关闭（原生 <dialog> 自带这个行为，换成覆盖层后要自己接）
+// 点遮罩关闭由 attachOverlayDismiss() 统一接管（见 openPackOverlay 附近）。
+// Escape 关闭（原生 <dialog> 自带这个行为，换成覆盖层后要自己接）：
+// 打包弹窗在上层，先关它；它没开才轮到帮助弹窗。
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && el.packOverlay.classList.contains('show')) closePackOverlay();
+  if (e.key !== 'Escape') return;
+  if (el.packOverlay.classList.contains('show')) closePackOverlay();
+  else if (el.helpOverlay.classList.contains('show')) closeHelpOverlay();
 });
 
 el.btnCopyLog.onclick = () => {

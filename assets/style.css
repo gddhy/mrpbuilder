@@ -514,3 +514,91 @@ body {
   from { opacity: 0.55; transform: translateY(2px); }
   to { opacity: 1; transform: none; }
 }
+
+/* ---------- 帮助弹窗 ---------- */
+
+/* 步骤列表：左侧圆形序号 + 卡片式正文，用来一眼看清「加载环境 → 编译 → 打包」这条主线 */
+.help-steps {
+  list-style: none;
+  counter-reset: hstep;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.help-steps > li {
+  counter-increment: hstep;
+  position: relative;
+  padding: 9px 12px 10px 44px;
+  border: 0.5px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-soft);
+}
+.help-steps > li::before {
+  content: counter(hstep);
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  border: 0.5px solid var(--accent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.help-steps h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 3px;
+  color: var(--text);
+}
+.help-steps p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-soft);
+}
+.help-steps ul {
+  margin: 3px 0 0;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-soft);
+}
+.help-steps ul li { margin-bottom: 3px; }
+.help-steps ul li:last-child { margin-bottom: 0; }
+.help-steps b,
+.help-tips b { color: var(--text); font-weight: 600; }
+
+.help-tips {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--text-soft);
+}
+.help-tips li { margin-bottom: 4px; }
+.help-tips li:last-child { margin-bottom: 0; }
+
+/* 帮助弹窗里的键位提示 */
+#helpOverlay kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0 4px;
+  border: 0.5px solid var(--line-strong);
+  border-bottom-width: 1.5px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* 帮助弹窗没有表单，底部只用一条按钮，给点内边距收尾 */
+#helpOverlay .dlg-actions {
+  padding-bottom: 16px;
+}

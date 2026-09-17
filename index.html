@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MRP 纯前端编译环境 · v86 + arm-none-eabi-gcc</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="assets/style.css?v=20260916c">
+<link rel="stylesheet" href="assets/style.css?v=20260917a">
 </head>
 <body>
 
@@ -20,6 +20,7 @@
     <button id="btnBuild" class="btn primary" disabled>编译</button>
     <button id="btnDownload" class="btn" disabled>下载 bin.elf</button>
     <button id="btnPack" class="btn" disabled>打包 .mrp</button>
+    <button id="btnHelp" class="btn" title="查看使用流程：加载环境 → 编译 → 打包">帮助</button>
   </div>
 </header>
 
@@ -155,8 +156,65 @@
       <button id="btnPackGo" class="btn primary" type="button">生成并下载 .mrp</button>
     </div>
   </div>
+  </div>
 </div>
 
-<script type="module" src="assets/app.js?v=20260916e"></script>
+<div id="helpOverlay" class="overlay">
+  <div class="dlg" role="dialog" aria-modal="true" aria-label="使用帮助">
+  <div class="dlg-body">
+    <h2>使用帮助</h2>
+    <p class="dlg-lead">
+      整个流程都在浏览器里完成：<b>加载环境 → 编译 → 打包</b>。
+      不需要安装工具链，也不需要联网后端。
+    </p>
+
+    <ol class="help-steps">
+      <li>
+        <h3>加载编译环境</h3>
+        <p>点顶栏的「启动编译环境」。它会启动一台内置的 32 位 Linux，并把
+          <code>arm-none-eabi-gcc</code> 工具链装进去。首次约 20~30 秒，
+          状态变成「环境就绪」（左侧圆点转绿）后才能编译。</p>
+      </li>
+      <li>
+        <h3>导入工程代码</h3>
+        <ul>
+          <li><b>导入单个文件</b>：点「选择文件」，或把 <code>.c</code> / <code>.h</code> /
+            资源文件直接拖进页面。同名文件会覆盖内置模板。</li>
+          <li><b>导入 zip 工程包</b>：直接把 zip 拖进来就行 —— 会自动解压铺进工程，
+            并自动判断入口源文件（优先 <code>main.c</code>，其次扫描含
+            <code>main()</code> 的 <code>.c</code>）；整包只有一层顶层目录时会自动剥掉。</li>
+          <li><b>下载 demo 工程</b>：点左侧「下载demo」，得到完整的示例工程 zip
+            —— <b>里面带有 mythroad 运行时</b>（<code>src/</code> 的运行时源码 + <code>lib/</code> 壳文件），
+            可以在它基础上开发自己的 MRP 程序，改完再打包成 zip 拖回来。</li>
+        </ul>
+      </li>
+      <li>
+        <h3>编译</h3>
+        <p>点「编译」（或 <kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd>），产物是 <code>bin.elf</code>。
+          编译选项里可以改入口源文件、填额外参数；嫌完整构建慢可以填 <code>-O0</code>。</p>
+      </li>
+      <li>
+        <h3>打包 .mrp</h3>
+        <p>点「打包 .mrp」，填显示名 / 内部名 / appid / 版本等信息，即可生成并下载
+          能装到功能机上的 <code>.mrp</code>（<code>start.mr</code> + <code>bin.elf</code> +
+          资源 + <code>cfunction.ext</code> 会自动按顺序封装，无需手动准备）。</p>
+      </li>
+    </ol>
+
+    <h3 class="dlg-h3">几个提示</h3>
+    <ul class="help-tips">
+      <li>手里已经有编好的 <code>bin.elf</code> 时，直接把它拖进页面就能打包，不必重新编译。</li>
+      <li>完整构建（<code>-Os</code>，含启动虚拟机与装工具链）约 3~4 分钟，
+        大部分时间花在编译本身。</li>
+    </ul>
+
+    <div class="dlg-actions">
+      <button id="btnHelpClose" class="btn primary" type="button">知道了</button>
+    </div>
+  </div>
+  </div>
+</div>
+
+<script type="module" src="assets/app.js?v=20260917a"></script>
 </body>
 </html>
