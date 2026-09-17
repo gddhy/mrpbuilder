@@ -1,3 +1,11 @@
+/*
+ * 主题色板。
+ *
+ * 浅色取 :root，深色取 :root[data-theme="dark"]（生效值由 assets/theme.js 写到 <html>）。
+ * 规则：**组件样式里不许再出现字面颜色**，一律从这里取变量，否则加主题时必漏。
+ * 深色不是简单取反：--accent / --ok / --warn / --err 都要往亮里提，
+ * 不然在深底上对比度不够（#185fa5 这种深蓝在深色底上几乎看不出是链接色）。
+ */
 :root {
   --bg: #ffffff;
   --bg-soft: #f6f6f4;
@@ -12,8 +20,92 @@
   --ok: #0f6e56;
   --warn: #854f0b;
   --err: #a32d2d;
+  /* 语义色：悬停底、弹窗遮罩、弹窗投影、控制台正文色、报错高亮 */
+  --hover: rgba(0, 0, 0, 0.045);
+  --overlay: rgba(0, 0, 0, 0.35);
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  --console-text: #2c2c2a;
+  --err-soft: #fdeaea;
+  --err-ring: rgba(163, 45, 45, 0.14);
+  /* 主题切换的时序（与主题无关、两套共用；改数字要同步 assets/theme.js 的 ANIM_MS） */
+  --theme-fade: 0.28s;      /* 表面（背景 / 边框 / 投影）的渐变时长 */
+  --theme-ink-delay: 0.12s; /* 文字与图标颜色"跳变"的时刻，理由见 :root.theme-anim 那段 */
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 让原生控件（滚动条、输入框光标、数字框上下箭头）跟着走浅色 */
+  color-scheme: light;
+}
+
+/* 深色：偏暖的中性灰，和浅色那套暖灰是同一族，避免深色下变成"蓝灰"而风格割裂 */
+:root[data-theme="dark"] {
+  --bg: #1b1b19;
+  --bg-soft: #232322;
+  --bg-sunken: #131312;
+  --line: rgba(255, 255, 255, 0.13);
+  --line-strong: rgba(255, 255, 255, 0.27);
+  --text: #ecebe6;
+  --text-soft: #b4b2aa;
+  --text-faint: #8b897f;
+  --accent: #7cb6ea;
+  --accent-soft: #17334a;
+  --ok: #56c39b;
+  --warn: #d9a441;
+  --err: #f08a8a;
+  --hover: rgba(255, 255, 255, 0.06);
+  --overlay: rgba(0, 0, 0, 0.6);
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  --console-text: #d7d5cd;
+  --err-soft: #3a2020;
+  --err-ring: rgba(240, 138, 138, 0.18);
+  color-scheme: dark;
+}
+
+/*
+ * 主题切换的过渡。
+ *
+ * 分两段，是刻意的 —— 两段合起来才不会"闪"：
+ *
+ *   ① 表面（背景 / 边框 / 投影）用 --theme-fade 慢慢淡入淡出；
+ *   ② 墨色（文字、图标）**不做淡入淡出，而是在 --theme-ink-delay 处一次性跳变**。
+ *
+ * 为什么墨色不能一起淡：深浅两套的墨色和底色亮度是**反的**（浅色是深字白底、
+ * 深色是白字黑底），两边同时淡，中途必然出现"墨色 ≈ 底色"。实测把两边都做 240ms 淡入淡出，
+ * 正文/正文底的对比度会从 16.5:1 掉到 1.03:1 —— 相当于内容在过渡中间整片消失再回来，
+ * 眼睛看到的就是"闪一下"，按钮里那个小图标尤其明显。
+ * 改成中途跳变后，跳变点两侧最差也有 3:1 左右（跳变时机取表面渐变到 ~40% 处，
+ * 此时底色亮度正好落在两套墨色的中间），全程都没有"糊成一片"的瞬间。
+ *
+ * 顺带解决另一个坑：图标是 `stroke="currentColor"`，靠继承动画中的 color 上色时，
+ * Chrome 不会逐帧重解析（实测整段过渡里图标 stroke 一直卡在旧色、连一行 stroke 过渡都没起），
+ * 表现就是"图标一直暗着 → 结束时突然跳亮"。墨色不再走动画后，currentColor 就能正常解析了。
+ *
+ * **不要写 `transition: all`** —— 那会把布局属性（宽高、内边距）也卷进来，
+ * 弹窗显隐、打包清单增减时会莫名其妙地滑动。
+ * 挂在 :root.theme-anim 下而不是无条件常开：常开会给所有元素的 hover 也加延迟（鼠标划过发黏），
+ * 首屏若属性突变也不会白闪一下。类由 assets/theme.js 挂上、动画跑完后摘掉
+ * （浏览器在**同一次样式计算**里就能看到"新类 + 新颜色"，过渡照样会跑）。
+ */
+:root.theme-anim *,
+:root.theme-anim *::before,
+:root.theme-anim *::after {
+  transition:
+    background-color var(--theme-fade) ease,
+    border-color var(--theme-fade) ease,
+    box-shadow var(--theme-fade) ease,
+    /* 0s + 延迟 = 到点直接跳变，不做插值 */
+    color 0s linear var(--theme-ink-delay),
+    stroke 0s linear var(--theme-ink-delay),
+    /* 顶栏那对日月图标是叠着、用 opacity 切换的，也要跟墨色在同一时刻换 */
+    opacity 0s linear var(--theme-ink-delay);
+}
+
+/* 系统开了"减少动态效果"就不做过渡（无障碍设置优先于观感） */
+@media (prefers-reduced-motion: reduce) {
+  :root.theme-anim *,
+  :root.theme-anim *::before,
+  :root.theme-anim *::after {
+    transition: none;
+  }
 }
 
 * { box-sizing: border-box; }
@@ -101,6 +193,46 @@ body {
 }
 .btn.small { padding: 3px 9px; }
 
+/* 顶栏的主题切换按钮：只有图标，但要和旁边那排文字按钮**一样大**。
+   做法：inline-grid 居中 + 用一个零宽的撑高块占住"一行行高"，内边距也与文字按钮一致。
+   文字按钮的高度本来就是被行高撑出来的，所以两者天然等高，而且**不写死像素** ——
+   写死会在 1x / 2x 屏上因边框 0.5px 取整不同而差 1px，以后改字号也会脱节。
+   （踩过：一开始用 inline-flex + line-height:0，内容高只剩图标那 14px，
+   整颗按钮 26px，比旁边那排矮 5px，看着"小一号"。） */
+.btn.icon {
+  display: inline-grid;
+  place-items: center;
+  padding: 5px 12px;
+}
+.btn.icon::before {
+  content: '';
+  grid-area: 1 / 1;
+  width: 0;
+  height: 1.6em; /* 兜底：与正文行高一致（老浏览器不认下面的 lh 单位） */
+  height: 1lh;   /* 首选：浏览器直接给出当前行高，改 line-height 也不会脱节 */
+}
+/* 日 / 月两个 svg 都在 DOM 里，叠在**同一格**上，靠 opacity 决定显哪个（见文件末尾的规则）。
+   为什么不用 display:none 切换：从 display:none 变可见的元素**不会启动过渡**（规范如此），
+   新图标一冒出来就是最终色 —— 切换时它会在还没暗下来的底色上"先看不见再出现"。
+   叠着用 opacity 切换，两个图标从头到尾都在渲染，颜色才能跟着文字一起做"中途跳变"。
+   显示的是**点击后会去的那一侧**（浅色时显示月亮），比显示当前状态更符合"按钮说明动作"。
+   JS 不参与图标切换，所以哪怕 theme.js 没加载，图标也是对的。 */
+.btn.icon .ico {
+  grid-area: 1 / 1;
+  width: 14px;
+  height: 14px;
+  display: block;
+  /* 图标颜色不能只靠 svg 上的 stroke="currentColor" 继承父级 color：
+     父级 color 在过渡时 Chrome 不会重新解析 currentColor（实测整段切换里 stroke 卡在旧色、
+     连一条 stroke 过渡都起不来），表现就是"图标一直暗着、结束时才突然跳亮"。
+     让图标**自己持有墨色**、并让 color 走同一套"中途跳变"，画笔跟自己的 color 走。 */
+  color: var(--text);
+  stroke: currentColor;
+}
+.btn.icon .ico-sun { opacity: 0; }
+:root[data-theme="dark"] .btn.icon .ico-sun { opacity: 1; }
+:root[data-theme="dark"] .btn.icon .ico-moon { opacity: 0; }
+
 /* ---------- 布局 ---------- */
 
 .layout {
@@ -181,7 +313,7 @@ body {
   font-size: 12px;
   cursor: pointer;
 }
-.filelist li:hover { background: rgba(0, 0, 0, 0.045); }
+.filelist li:hover { background: var(--hover); }
 .filelist li[aria-selected="true"] {
   background: var(--accent-soft);
   color: var(--accent);
@@ -317,7 +449,7 @@ body {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
-  color: #2c2c2a;
+  color: var(--console-text);
   /* 日志必须能选中复制（键盘 Ctrl/Cmd+A 也可，见 tabindex） */
   user-select: text;
   -webkit-user-select: text;
@@ -346,7 +478,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--overlay);
 }
 .overlay.show { display: flex; }
 
@@ -364,7 +496,7 @@ body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow);
 }
 .dlg-body {
   padding: 18px 20px 0;
@@ -433,7 +565,7 @@ body {
 .field-grid input.bad,
 .field-grid textarea.bad {
   border-color: var(--err);
-  box-shadow: 0 0 0 2px rgba(163, 45, 45, 0.14);
+  box-shadow: 0 0 0 2px var(--err-ring);
 }
 .field-grid input.bad:focus,
 .field-grid textarea.bad:focus { border-color: var(--err); }
@@ -505,8 +637,8 @@ body {
   padding: 4px 9px;
   margin-left: -9px; /* 抵消内边距，左边缘仍与其他内容对齐 */
   color: var(--err);
-  background: #fdeaea;
-  box-shadow: inset 0 0 0 1px rgba(163, 45, 45, 0.35);
+  background: var(--err-soft);
+  box-shadow: inset 0 0 0 1px var(--err-ring);
   font-weight: 600;
   animation: packNoteIn 0.18s ease-out;
 }

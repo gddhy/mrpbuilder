@@ -45,7 +45,15 @@ const MIME = {
 };
 
 const server = http.createServer((req, res) => {
-  let rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  // 注意：req.url 可能是 "//"（协议相对形式），new URL 会直接抛
+  // ERR_INVALID_URL。不做捕获的话整个 server 会挂掉、后续请求全部连接失败。
+  let rel;
+  try {
+    rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  } catch {
+    res.writeHead(400).end('bad request');
+    return;
+  }
   if (rel.endsWith('/')) rel += 'index.html';
   // 防目录穿越
   const file = path.resolve(ROOT, '.' + rel);

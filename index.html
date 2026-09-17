@@ -5,7 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MRP 纯前端编译环境 · v86 + arm-none-eabi-gcc</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="assets/style.css?v=20260917a">
+<link rel="stylesheet" href="assets/style.css?v=20260917d">
+<script>
+  /*
+   * 主题：在首次渲染之前把生效值打到 <html data-theme>，否则会先白一下再变深色。
+   * 规则与 assets/theme.js 一致：存过的手动选择优先（localStorage: mrp-theme），
+   * 没存过就跟随浏览器（prefers-color-scheme）。
+   * 这段是唯一一处"为了防闪而重复"的逻辑，改动时两边一起改。
+   */
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('mrp-theme'); } catch (e) {}
+    var dark = saved === 'light' || saved === 'dark'
+      ? saved === 'dark'
+      : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    var root = document.documentElement;
+    root.setAttribute('data-theme', dark ? 'dark' : 'light');
+    // 内联脚本先于 theme.js 跑，按钮文案由 theme.js 补（它才知道"是否跟随系统"）
+  })();
+</script>
 </head>
 <body>
 
@@ -21,6 +39,11 @@
     <button id="btnDownload" class="btn" disabled>下载 bin.elf</button>
     <button id="btnPack" class="btn" disabled>打包 .mrp</button>
     <button id="btnHelp" class="btn" title="查看使用流程：加载环境 → 编译 → 打包">帮助</button>
+    <!-- 主题切换：纯图标按钮，尺寸与高度对齐旁边那排文字按钮（靠行高撑，见 style.css 的 .btn.icon）。
+         两个图标紧挨着写、中间不留空白 —— 按钮内是行盒，夹一个空格会让图标不能居中。 -->
+    <button id="btnTheme" class="btn icon" type="button" title="切换深色模式" aria-label="切换深色模式"><svg class="ico ico-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"
+        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.7A8.6 8.6 0 1 1 9.3 3.5a6.9 6.9 0 0 0 11.2 11.2Z"/></svg><svg class="ico ico-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"
+        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.1"/><path d="M12 2.4v2.3M12 19.3v2.3M2.4 12h2.3M19.3 12h2.3M5.3 5.3l1.6 1.7M17.1 17l1.6 1.7M18.7 5.3 17.1 7M7 17l-1.7 1.7"/></svg></button>
   </div>
 </header>
 
@@ -215,6 +238,6 @@
   </div>
 </div>
 
-<script type="module" src="assets/app.js?v=20260917a"></script>
+<script type="module" src="assets/app.js?v=20260917d"></script>
 </body>
 </html>

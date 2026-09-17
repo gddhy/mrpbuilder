@@ -9,6 +9,19 @@
      也不能简单取"当前目录"（深路径 404 时会算错）。
      做法：从当前目录逐级向上 HEAD 探测 index.html，第一个命中的就是应用根；
      全部失败则回退 /。探测完成后再开始 3 秒倒计时。 -->
+<script>
+  /* 主题：与主页面共用同一份偏好（localStorage: mrp-theme），规则见 assets/theme.js ——
+     存过的手动选择优先，没存过就跟随浏览器。本页是独立静态页（不引主站 css/js），
+     所以自带一份最小实现，只为让深色用户别撞到一屏白。 */
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('mrp-theme'); } catch (e) {}
+    var dark = saved === 'light' || saved === 'dark'
+      ? saved === 'dark'
+      : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  })();
+</script>
 <style>
   body {
     margin: 0;
@@ -27,6 +40,14 @@
   .bar { display: inline-block; height: 3px; background: #b0885a; width: 100%;
          transform-origin: left; animation: shrink 3s linear forwards; margin-top: 16px; }
   @keyframes shrink { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+
+  /* 深色：同上，跟随 data-theme（选择器比上面的裸元素选择器更具体，直接覆盖即可） */
+  html[data-theme="dark"] { color-scheme: dark; }
+  html[data-theme="dark"] body { background: #1b1b19; color: #ecebe6; }
+  html[data-theme="dark"] .code { color: #d9a441; }
+  html[data-theme="dark"] p { color: #b4b2aa; }
+  html[data-theme="dark"] a { color: #7cb6ea; }
+  html[data-theme="dark"] .bar { background: #d9a441; }
 </style>
 </head>
 <body>

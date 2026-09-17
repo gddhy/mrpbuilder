@@ -9,6 +9,7 @@
 import { MrpVm } from './vm.js';
 import { unzip } from './zip.js';
 import { fmtBytes } from './bytes.js'; // 体积文案（B/KB/MB 自动换算），与命令行共用同一份
+import { initTheme, toggleTheme } from './theme.js'; // 浅色/深色主题（未手动选择时跟随浏览器）
 import {
   packMrp,
   parseMrp,
@@ -44,6 +45,7 @@ const el = {
   btnPack: $('btnPack'),
   btnHelp: $('btnHelp'),
   btnHelpClose: $('btnHelpClose'),
+  btnTheme: $('btnTheme'),
   helpOverlay: $('helpOverlay'),
   packOverlay: $('packOverlay'),
   packList: $('packList'),
@@ -900,6 +902,11 @@ el.btnPackCancel.onclick = closePackOverlay;
 el.btnPackGo.onclick = doPack;
 el.btnHelp.onclick = openHelpOverlay;
 el.btnHelpClose.onclick = closeHelpOverlay;
+el.btnTheme.onclick = toggleTheme;
+
+// 主题：data-theme 已由 index.html 里的内联脚本在首屏前打好（防闪白），
+// 这里补上按钮提示文案，并挂上「系统主题变化 / 其他标签页改偏好」的同步。
+initTheme(el.btnTheme);
 
 for (const input of [...PACK_FIELDS, el.pkDesc]) {
   input.addEventListener('input', () => {
