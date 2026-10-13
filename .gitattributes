@@ -1,0 +1,7 @@
+# 引擎预编译归档：二进制（ar 归档），绝不能让 autocrlf 动它 —— 被改写一个字节
+# 就会变成「链接期报奇怪的错」，排查成本极高。
+mrp_demo/lib/*.a binary
+
+# 模板 Makefile 必须是 LF：guest 的 make 直接消费它，CRLF 会把续行符 "\" 打断
+# （assets/app.js 会把它推进虚拟机；assets/image/rootfs.tar.gz 里也有一份）。
+mrp_demo/Makefile text eol=lf

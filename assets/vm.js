@@ -292,6 +292,19 @@ export class MrpVm {
     if (rc !== 0) throw new Error(`解压工具链失败（rc=${rc}）`);
     onProgress?.(1);
 
+    /*
+     * 顺手留一份「没被改动过」的模板副本。
+     * 工程目录是用户唯一会往里写东西的地方，而「恢复模板」必须把它整目录换回来 ——
+     * 只清前端那份状态的话，用户的 main.c / src/xxx.c 还留在 guest 里，
+     * make 照样拿它们编译，甚至因为觉得没变化而直接交回上一次的产物
+     * （`Nothing to be done for 'all'`）。
+     * 实测 cp -a 这份（1.3 MB / 50 个文件）只要 0.2 秒，比重启虚拟机（≈30s）划算得多。
+     */
+    rc = await this.run(`rm -rf ${TC}/.mrp_demo_pristine && cp -a ${PROJ} ${TC}/.mrp_demo_pristine`, {
+      timeout: 300_000,
+    });
+    if (rc !== 0) throw new Error('留存模板副本失败（「恢复模板」要用它）');
+
     // 自带 rootfs 是 uClibc，工具链是 glibc 的，必须把 glibc 的 loader 放到
     // /lib/ld-linux.so.2（buildroot 没有这个路径，不冲突），并指定库搜索路径。
     this.opts.onStatus?.('配置运行环境');
@@ -345,8 +358,13 @@ export class MrpVm {
    * @param {string} [o.app]     入口源文件
    * @param {string} [o.target]  产物名
    * @param {string} [o.extra]   额外编译参数
+   * @returns {{ok:boolean, code:number, artifact:object|null,
+   *            timing:{syncMs:number, compileMs:number, artifactMs:number, totalMs:number}}}
+   *          timing 各段之和 = totalMs（同步源码 + 编译 + 取回产物）；
+   *          失败时也返回，方便调用方报出「已经花了多久」。
    */
   async build({ files = {}, app = 'helloworld.c', target = 'bin.elf', extra = '' } = {}) {
+    const t0 = Date.now();
     this.opts.onStatus?.('同步源码');
     let i = 0;
     for (const [name, bytes] of Object.entries(files)) {
@@ -380,23 +398,66 @@ export class MrpVm {
       const rc = await this.run(cmd, { timeout: 120_000 });
       if (rc !== 0) throw new Error(`写入 ${name} 失败`);
     }
+    const syncMs = Date.now() - t0;
 
     this.opts.onStatus?.('编译中');
     const extraArg = extra ? ` EXTRA='${extra.replace(/'/g, "'\\''")}'` : '';
+    const tCompile = Date.now();
     const rc = await this.run(
       `cd ${PROJ} && make APP='${app}' TARGET='${target}'${extraArg}`,
       { timeout: 900_000 }
     );
-    if (rc !== 0) return { ok: false, code: rc, artifact: null };
+    const compileMs = Date.now() - tCompile;
+    if (rc !== 0) {
+      return {
+        ok: false,
+        code: rc,
+        artifact: null,
+        timing: { syncMs, compileMs, artifactMs: 0, totalMs: Date.now() - t0 },
+      };
+    }
 
     // 取回产物
+    const tArtifact = Date.now();
     const copyRc = await this.run(
       `cp -f '${PROJ}/${target}' ${SHARE}/__artifact`,
       { timeout: 180_000 }
     );
     if (copyRc !== 0) throw new Error('产物写回共享目录失败');
     const artifact = await this.getFile('__artifact');
-    return { ok: true, code: 0, artifact: { name: target, bytes: artifact } };
+    return {
+      ok: true,
+      code: 0,
+      artifact: { name: target, bytes: artifact },
+      timing: {
+        syncMs,
+        compileMs,
+        artifactMs: Date.now() - tArtifact,
+        totalMs: Date.now() - t0,
+      },
+    };
+  }
+
+  /**
+   * 把工程目录整个还原成镜像内置的模板。
+   *
+   * 为什么非要在虚拟机里做：工程目录是用户唯一会往里写东西的地方。
+   * 前端那份状态（overrides / 勾选 / 编辑器）清了并不等于虚拟机里干净 ——
+   * 用户的 main.c、src/xxx.c 还在，make 会照样拿它们去编，甚至因为
+   * 「依赖都比产物的时间戳旧」而直接交回上一次的产物（`Nothing to be done for 'all'`）。
+   *
+   * 模板副本是装工具链时用 `cp -a` 留的（见 installToolchain，0.2 秒）。
+   * 连同 bin.elf 一起换掉，所以恢复之后必然是一次真正的编译。
+   * 引擎预编译归档在 lib/ 里，也一起没了 —— 调用方要把「已经推过归档」的标记复位。
+   */
+  async resetProject() {
+    const rc = await this.run(
+      `if [ -d ${TC}/.mrp_demo_pristine ]; then ` +
+        `rm -rf ${PROJ} && cp -a ${TC}/.mrp_demo_pristine ${PROJ}; ` +
+        `else echo NO_PRISTINE >&2; exit 3; fi`,
+      { timeout: 300_000 }
+    );
+    if (rc !== 0) throw new Error('恢复模板失败：虚拟机里的工程目录没能还原');
   }
 
   /** 读一个工程内的文件（走 9p，不用串口，二进制也安全） */

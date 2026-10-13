@@ -277,7 +277,15 @@ body {
   margin: 0;
   color: var(--text-soft);
 }
-.pane-head-actions { display: flex; align-items: center; gap: 8px; }
+/* 四个按钮（选择文件 / 选择文件夹 / 下载demo / 恢复模板）在窄窗口里换行，
+   别和「工程文件」标题抢宽度 */
+.pane-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 
 .muted { color: var(--text-faint); font-size: 12px; }
 

@@ -19,7 +19,7 @@
  *   2) bitmap.c 直接 #include <math.h>，调用了 sqrt / atan2。
  *
  *   3) mrc_getSysMem / mrc_getMemoryRemain 在 mrc_base.h 里有声明，
- *      全工程却没有实现 —— armcc 时代这两个由厂商 .lib 提供。
+ *      全工程却没有实现 —— 这两个符号历来由厂商的预编译库提供。
  *      在 mythroad 里它们就是读 mr_table 的 LG_mem_len / LG_mem_left
  *      这两个「指向值的指针」字段，这里按同样语义接上。
  *

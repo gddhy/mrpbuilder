@@ -7,8 +7,15 @@
  */
 
 import { MrpVm } from './vm.js';
-import { unzip } from './zip.js';
-import { fmtBytes } from './bytes.js'; // 体积文案（B/KB/MB 自动换算），与命令行共用同一份
+import { unzip, zipDeflate } from './zip.js';
+import { cacheEntryMatches, readImageCache, writeImageCache } from './imagecache.js';
+import { fmtBytes, fmtDuration } from './bytes.js'; // 体积/耗时文案，与命令行共用同一份
+import {
+  isJunkEntry,
+  relativeNames,
+  parseGitignore,
+  applyGitignore,
+} from './ingest.js'; // 导入外来文件的路径规则（纯函数，有单测）
 import { initTheme, toggleTheme } from './theme.js'; // 浅色/深色主题（未手动选择时跟随浏览器）
 import {
   packMrp,
@@ -38,6 +45,7 @@ const el = {
   btnBoot: $('btnBoot'),
   btnBuild: $('btnBuild'),
   btnDownload: $('btnDownload'),
+  btnDemo: $('btnDemo'),
   btnReset: $('btnReset'),
   btnClear: $('btnClear'),
   btnCopyLog: $('btnCopyLog'),
@@ -67,6 +75,7 @@ const el = {
   pkVendorHint: $('pkVendorHint'),
   pkDescHint: $('pkDescHint'),
   fileInput: $('fileInput'),
+  dirInput: $('dirInput'),
   fileList: $('fileList'),
   editor: $('editor'),
   editorHint: $('editorHint'),
@@ -80,14 +89,29 @@ const state = {
   vm: null,
   phase: 'off',        // off | boot | ready | err
   template: [],        // 镜像内置模板里的相对路径
+  // 模板自带的 Makefile 字节：启动时从虚拟机读一份（镜像里那份），另加站点上那份。
+  // 用途：判断「导进来的 Makefile 是不是模板自带的」——见 isTemplateMakefile。
+  templateMakefiles: [],
   overrides: new Map(),// 相对路径 -> Uint8Array（用户上传/编辑过的）
+  fromGuest: new Set(),// overrides 里那些「从模板原样读进来、没改过」的（编译时不重推）
   uploaded: new Set(), // 真正由用户上传/拖入的文件（用于挑「资源」）
   shell: new Map(),    // 壳文件字节缓存（lib/start.mr、lib/cfunction.ext）
   packRes: new Set(),  // 打包时勾选的资源
   packResTouched: false,
   selected: null,
+  /**
+   * 编辑器里当前这份文本的基准：{ name, text }。
+   * 判断「用户到底动没动」要看文本，不能只看重新编码后的字节 ——
+   * textarea 的 value 会把 CRLF/CR 归一化成 LF（HTML 规范如此，已实测），
+   * 而 src/ 下 30 个 .c/.h 都是 CRLF：重新编码会把这些文件改小，
+   * 于是「只是点开看一眼」就变成了「改过源码」（引擎摘要变 → 白重建一次归档）。
+   */
+  editorBase: null,
   artifact: null,
   busy: false,
+  enginePushed: false, // 引擎预编译归档是否已推进这台虚拟机（一次会话只推一次）
+  engineRebuilt: false, // 本轮编译里 guest 是否重建了引擎归档（由日志识别，用于解释耗时）
+  nothingToDo: false, // 本轮 make 是否认为「没有需要重编的」（产物是上一次那份）
   logBuf: [],
 };
 
@@ -104,8 +128,25 @@ function stripAnsi(s) {
 
 let flushTimer = null;
 function pushOutput(text) {
+  // 从 guest 的编译输出里认一下「这轮重建了引擎归档」——
+  // 只有改过 src/ 才会有，是解释「为什么这轮要 3 分钟」的关键信息
+  if (/\[make\] precompiling engine runtime/.test(text)) state.engineRebuilt = true;
+  // make 认为没有需要重编的（几秒内「编译完成」）：产物就是上一次那份，
+  // 说清楚，免得看起来像「刚编出来」的
+  if (/Nothing to be done for 'all'/.test(text)) state.nothingToDo = true;
   state.logBuf.push(text);
   if (!flushTimer) flushTimer = setTimeout(flush, 80);
+}
+
+/** 本轮编译耗时文案：分段之和就是总耗时，一眼看出时间花在哪 */
+function fmtTiming(t) {
+  if (!t) return '';
+  const parts = [
+    `同步源码 ${fmtDuration(t.syncMs)}`,
+    `编译 ${fmtDuration(t.compileMs)}${state.engineRebuilt ? '（含重建引擎归档）' : ''}`,
+    `取回产物 ${fmtDuration(t.artifactMs)}`,
+  ];
+  return `${fmtDuration(t.totalMs)}（${parts.join(' · ')}）`;
 }
 
 function writeLine(text) {
@@ -215,12 +256,45 @@ function setPhase(p, text) {
   state.phase = p;
   el.dot.dataset.state = p;
   el.status.textContent = text;
+  refreshDemoButton();
 }
 
 function setBusy(on) {
   state.busy = on;
   el.btnBuild.disabled = on || state.phase !== 'ready';
   el.btnBoot.disabled = on || state.phase === 'boot' || state.phase === 'ready';
+  refreshDemoButton();
+}
+
+/**
+ * 现在还是「没被动过的内置模板」吗？
+ * 直接决定「下载demo」能不能点：那个按钮是从虚拟机里现取模板打包的，
+ * 一旦用户改过（编辑过内容、或传了自己的文件），取出来的就不是内置模板了，
+ * 下载下来只会误导人 —— 所以宁可不给点。
+ *
+ * 判定看两处：
+ *   · `state.uploaded` 非空 → 用户传过文件（拖入/选择/解压 zip）→ 算改过；
+ *   · `state.overrides` 里存在不在 `fromGuest` 里的条目 → 有真实编辑 →
+ *     算改过（`fromGuest` 是「从模板读进编辑器看一眼、没动过」的那些，
+ *     它们和虚拟机里那份逐字节相同，不影响打包结果）。
+ */
+function isTemplatePristine() {
+  if (state.uploaded.size) return false;
+  for (const n of state.overrides.keys()) if (!state.fromGuest.has(n)) return false;
+  return true;
+}
+
+/** 「下载demo」的可用状态与提示文案 */
+function refreshDemoButton() {
+  if (!el.btnDemo) return;
+  const pristine = isTemplatePristine();
+  el.btnDemo.disabled = state.busy || state.phase !== 'ready' || !pristine;
+  el.btnDemo.title =
+    state.phase !== 'ready'
+      ? '先点「启动编译环境」——demo 工程包是现从虚拟机里的模板取的'
+      : pristine
+        ? '把内置示例工程的源码打包成 zip 下载（内容取自虚拟机里的模板，可改完再拖回来）'
+        : '已改动过工程，不能再下载 demo（避免下到的不是内置模板）；点「恢复模板」可恢复';
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +309,7 @@ function allFiles() {
 
 function renderFiles() {
   el.fileList.innerHTML = '';
+  refreshDemoButton(); // 文件列表变了基本就意味着「改过/恢复过」，按钮状态跟着走
   for (const name of allFiles()) {
     const li = document.createElement('li');
     li.setAttribute('aria-selected', String(name === state.selected));
@@ -250,12 +325,23 @@ function renderFiles() {
   }
 }
 
+/**
+ * 把文本放进编辑器，并把它记成「基准」。
+ * `el.editor.value` 读回来的就是 textarea 归一化后的形式（CRLF/CR → LF），
+ * saveEditor 拿它跟当前 value 比，一致就说明「用户没动过」→ 一个字节都不要重写。
+ */
+function setEditorText(name, text) {
+  el.editor.value = text;
+  state.editorBase = { name, text: el.editor.value };
+}
+
 async function selectFile(name) {
   state.selected = name;
   renderFiles();
 
   // 二进制资源不走编辑器：按 UTF-8 拆一份再保存回去会把内容改坏
   if (isBinaryName(name)) {
+    state.editorBase = null;
     el.editor.value = '';
     const inPack = isResourceCandidate(name);
     el.editorHint.textContent =
@@ -265,11 +351,12 @@ async function selectFile(name) {
   }
 
   if (state.overrides.has(name)) {
-    el.editor.value = new TextDecoder().decode(state.overrides.get(name));
+    setEditorText(name, new TextDecoder().decode(state.overrides.get(name)));
     el.editorHint.textContent = `${name}（已修改，编译时写入虚拟机）`;
     return;
   }
   if (state.phase !== 'ready') {
+    state.editorBase = null;
     el.editor.value = '';
     el.editorHint.textContent = `${name} —— 先启动编译环境才能读取模板内容`;
     return;
@@ -278,10 +365,15 @@ async function selectFile(name) {
   try {
     const bytes = await state.vm.readProjectFile(name);
     state.overrides.set(name, bytes);
-    el.editor.value = new TextDecoder().decode(bytes);
+    // 记成「与虚拟机里那份字节相同」：编译时不必再推一遍 —— 只是点开看一眼就
+    // 推回去，等于白白多一次 9p 写 + 一次 mkdir/cp 往返。
+    // （引擎归档的一致性由 Makefile 的摘要校验兜着，所以这里只是省事，不是必须。）
+    state.fromGuest.add(name);
+    setEditorText(name, new TextDecoder().decode(bytes));
     el.editorHint.textContent = `${name}（已从模板载入）`;
     renderFiles();
   } catch (e) {
+    state.editorBase = null;
     el.editorHint.textContent = `读取失败：${e.message}`;
   }
 }
@@ -289,16 +381,65 @@ async function selectFile(name) {
 function saveEditor() {
   if (!state.selected) return;
   if (isBinaryName(state.selected)) return; // 二进制资源不经过编辑器，避免被改坏
-  state.overrides.set(state.selected, new TextEncoder().encode(el.editor.value));
+  const name = state.selected;
+
+  /*
+   * 只是点开看一眼、没动过内容 → 一个字节都别写。
+   *
+   * 为什么不能直接「解码再编码」了事：textarea 会把 CRLF/CR 归一化成 LF
+   * （HTML 规范如此，实测 34 字节 → 31 字节），而 src/ 下 30 个 .c/.h 都是 CRLF。
+   * 一旦重写，这些文件在虚拟机里就被悄悄改小了 —— 引擎的内容摘要随之变化，
+   * 下一次编译要白白重建一遍归档（≈3 分钟），编译进去的也不再是模板那份源码。
+   */
+  if (
+    state.editorBase &&
+    state.editorBase.name === name &&
+    state.editorBase.text === el.editor.value
+  ) {
+    el.editorHint.textContent = state.fromGuest.has(name)
+      ? `${name}（已从模板载入，未修改）`
+      : `${name}（已修改，编译时写入虚拟机）`;
+    return;
+  }
+
+  const next = new TextEncoder().encode(el.editor.value);
+  const prev = state.overrides.get(name);
+  // build() 开头也会调这里 —— 光选中文件、内容没动过时不能算「改过」，
+  // 否则「点开看一眼再编译」就会把同一份源码多推一遍（还多一次往返）。
+  const unchanged =
+    prev && prev.length === next.length && prev.every((v, i) => v === next[i]);
+  state.overrides.set(name, next);
+  if (!unchanged) state.fromGuest.delete(name);
+  state.editorBase = { name, text: el.editor.value };
   renderFiles();
-  el.editorHint.textContent = `${state.selected}（已修改，编译时写入虚拟机）`;
+  el.editorHint.textContent = `${name}（已修改，编译时写入虚拟机）`;
 }
 
 // ---------------------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------------------
 
-let rootfsCache = null;
+let rootfsCache = null;      // 本次会话里已经拿到的镜像字节
+let rootfsCacheEntry;        // 从 IndexedDB 读到的缓存条目（undefined = 还没读过）
+let manifestCache;           // rootfs.parts.json（一次会话读一次；它决定"线上有没有变"）
+
+/** 读分段清单。index.html 之外的静态资源没有 ?v= 防缓存，这里显式 no-store */
+async function loadManifest() {
+  if (manifestCache !== undefined) return manifestCache;
+  try {
+    const r = await fetch(new URL('image/rootfs.parts.json', ASSETS), { cache: 'no-store' });
+    manifestCache = r.ok ? await r.json() : null;
+  } catch {
+    manifestCache = null;
+  }
+  return manifestCache;
+}
+
+/** 本地缓存条目（读一次就记住，避免 30MB 从 IndexedDB 反序列化两遍） */
+async function getCachedRootfs() {
+  if (rootfsCacheEntry === undefined) rootfsCacheEntry = await readImageCache();
+  return rootfsCacheEntry;
+}
 
 /**
  * 最新版模板 Makefile：镜像（rootfs.tar.gz）里烧的是打镜像那一刻的版本，
@@ -317,6 +458,74 @@ async function getTemplateMakefile() {
   return templateMakefileCache;
 }
 
+/** 两个字节数组是否逐字节相同 */
+function sameBytes(a, b) {
+  return (
+    a instanceof Uint8Array &&
+    b instanceof Uint8Array &&
+    a.length === b.length &&
+    a.every((v, i) => v === b[i])
+  );
+}
+
+/**
+ * 这份 Makefile 是不是「模板自带的」？
+ *
+ * Makefile 决定「编译时用不用引擎预编译归档」：站点上的模板带这套逻辑，
+ * 但**旧版模板没有**（镜像内置那份就是每次全量编译的老版本）。
+ * 「下载demo」会把当时虚拟机里的 Makefile 一起打包（本地开发要用），
+ * 用户把包拖回来时如果不加判断就当成「用户自己的 Makefile」，
+ * 站点上那份新模板就再也注入不进去了 —— 症状是之后每次编译都全量重编
+ * src/（≈2~3 分钟），而且日志里看不到任何归档相关的行（旧 Makefile 根本没那条输出）。
+ *
+ * 判据只看内容、不看来源：已知的模板样本有两份 —— 启动时虚拟机里那份
+ * （镜像自带）和站点上那份。
+ */
+async function isTemplateMakefile(name, bytes) {
+  if (name !== 'Makefile') return false;
+  const site = await getTemplateMakefile();
+  return [...state.templateMakefiles, site].some((t) => sameBytes(t, bytes));
+}
+
+/** Makefile 里带不带「引擎预编译归档」逻辑 —— 决定这轮是 3 秒还是 3 分钟 */
+const MK_ENGINE_RE = /engine-archive/;
+
+/**
+ * 引擎预编译归档（lib/libmrp_engine.a + 内容摘要 lib/libmrp_engine.key）。
+ *
+ * 这是编译提速的关键：没有它，每次构建都要把 src/ 下 19 个运行时源文件
+ * （1.2MB）从头编一遍 —— 在 v86 里实测 206.3 秒，占整条链路 91%。有它之后
+ * 只编用户自己的代码再链接，实测 3.1 秒，产物逐字节一致。
+ *
+ * `.key` 是「src/ 下所有 .c/.h 内容 + 编译参数」的 sha256 摘要，Makefile 每次
+ * 都会现算一份比对，对不上就自己重建归档。所以**归档与源码是否一致不由前端
+ * 保证**：用户改了 src/ 里的兼容层/适配层（mrp_compat.c、mrc_android.c、各种
+ * .h），或者换了镜像导致站点归档与源码对不上，都过不了这一步校验。这里把
+ * .key 一起推过去，只是为了让快路径能命中（否则每次都会白重建一次 ≈190s）。
+ *
+ * 用 no-store：两个文件都只在 mrp_demo/src/ 改动后才需要重新生成，一旦生成
+ * 就必须拿到最新的，不能吃到 HTTP 缓存里那份旧的。合计 323 KiB，远小于镜像。
+ */
+let engineArchiveCache;
+async function getEngineArtifacts() {
+  if (engineArchiveCache !== undefined) return engineArchiveCache;
+  try {
+    const out = [];
+    for (const name of ENGINE_FILES) {
+      const r = await fetch(new URL(`../mrp_demo/${name}`, import.meta.url), { cache: 'no-store' });
+      if (!r.ok) {
+        engineArchiveCache = null;
+        return null;
+      }
+      out.push([name, new Uint8Array(await r.arrayBuffer())]);
+    }
+    engineArchiveCache = out;
+  } catch {
+    engineArchiveCache = null;
+  }
+  return engineArchiveCache;
+}
+
 /** sha256 → hex。非安全上下文（file:// 或局域网 http）没有 crypto.subtle，返回 null */
 async function sha256Hex(bytes) {
   if (!globalThis.crypto?.subtle) return null;
@@ -325,24 +534,41 @@ async function sha256Hex(bytes) {
 }
 
 /**
- * 下载工具链镜像。
+ * 下载工具链镜像（带本地缓存）。
  * 优先读 rootfs.parts.json 按分段下载再拼合 —— Cloudflare Pages / EdgeOne Pages
  * 这类静态托管对单个文件有 25MB 上限，而镜像有 30.6 MiB，所以 make-image.py
  * 会把它按 20MiB 切开。拼好后校验总大小与 sha256（可用时），防止拼错或传输损坏。
+ *
+ * 缓存在 IndexedDB 里（见 assets/imagecache.js）：30.6 MiB 每次都重下纯属浪费。
+ * 用清单里的 sha256 判断线上有没有变 —— 变了就重下并覆盖，没变就直接用本地那份。
  */
 async function loadRootfs() {
-  let manifest = null;
-  try {
-    const r = await fetch(new URL('image/rootfs.parts.json', ASSETS), { cache: 'no-store' });
-    if (r.ok) manifest = await r.json();
-  } catch {
-    /* 没有清单就按单文件走 */
-  }
+  const manifest = await loadManifest();
 
   if (!manifest?.parts?.length) {
-    const r = await fetch(URLS.rootfs);
+    // 没有清单（单文件部署 / file://）：判断不了"线上有没有变"，所以不复用缓存，
+    // 老老实实下整包。这里不做缓存是刻意的 —— 宁可贵一点，也不要用到错版本工具链。
+    const r = await fetch(URLS.rootfs, { cache: 'no-store' });
     if (!r.ok) throw new Error(`工具链下载失败（HTTP ${r.status}）`);
-    return new Uint8Array(await r.arrayBuffer());
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    writeLine(`  收到 ${fmtBytes(bytes.length)}（无分段清单，不启用本地缓存）`);
+    return bytes;
+  }
+
+  // ---- 先看本地缓存 ----
+  const entry = await getCachedRootfs();
+  if (entry && cacheEntryMatches(entry, manifest)) {
+    // 大小对上还不够：磁盘损坏 / 上次写到一半中断都可能留下坏字节，
+    // 所以再按清单的 sha256 自校验一遍（拿不到 crypto.subtle 时才跳过）。
+    const hex = await sha256Hex(entry.bytes);
+    if (!hex || hex === manifest.sha256) {
+      const savedAt = entry.savedAt ? new Date(entry.savedAt).toLocaleString() : '未知时间';
+      writeLine(`  ✓ 本地缓存命中：${fmtBytes(entry.size)}（存于 ${savedAt}）→ 不再联网下载`);
+      return entry.bytes instanceof Uint8Array ? entry.bytes : new Uint8Array(entry.bytes);
+    }
+    writeLine('  ⚠ 本地缓存的镜像校验不过（可能已损坏）→ 重新下载');
+  } else if (entry) {
+    writeLine('  ⚠ 线上的镜像已变更 → 重新下载');
   }
 
   writeLine(`  镜像按 ${manifest.parts.length} 个分段下载（单段上限 ${fmtBytes(manifest.partBytes)}）`);
@@ -374,10 +600,18 @@ async function loadRootfs() {
   if (hex && manifest.sha256 && hex !== manifest.sha256) {
     // 不在这里硬失败：有些服务器会对镜像做转码（见 installToolchain 的兜底压缩），
     // 那种情况 sha 一定对不上，但内容仍可用；后面还有格式与大小两道校验兜底。
+    // 这种"转码过"的字节也**不写缓存**：写进去下次会被自校验判成损坏、白下一遍。
     writeLine('  ⚠ sha256 与清单不符（若服务器对镜像做过转码可忽略，后续仍会校验）');
   } else if (hex) {
     writeLine('  sha256 校验通过');
   }
+
+  if (!hex || hex === manifest.sha256) {
+    const ok = await writeImageCache(all, { sha256: manifest.sha256, size: manifest.size });
+    rootfsCacheEntry = undefined; // 缓存内容变了，下次要重新读
+    writeLine(ok ? '  已存入本地缓存，下次打开直接用它' : '  ⚠ 本地缓存写入失败（隐私模式 / 配额不足），下次仍需重新下载');
+  }
+
   return all;
 }
 
@@ -386,26 +620,31 @@ async function boot() {
   setPhase('boot', '正在启动 …');
   setBusy(true);
   clearConsole();
-  writeLine('正在加载内核与工具链（首次约 1~3 分钟，取决于机器性能）…');
+  writeLine('正在加载内核与工具链（首次约 1~3 分钟，取决于机器性能和网络）…');
 
   try {
-    // 先确认镜像文件都在，避免白等。
+    // 先确认镜像能拿到，避免白等。
     // 工具链优先按分段清单校验（EdgeOne/CF Pages 等 25MB 限制的静态托管上
     // 完整 rootfs.tar.gz 根本不存在，HEAD 它必然 404）：有清单就逐段 HEAD，
     // 完全不碰完整镜像；没有清单才回退检查单文件。
-    const mRes = await fetch(new URL('image/rootfs.parts.json', ASSETS), { cache: 'no-store' });
-    const manifest = mRes.ok ? await mRes.json().catch(() => null) : null;
-    const rootfsChecks = manifest?.parts?.length
-      ? manifest.parts.map((p) => [`工具链分段 ${p.name}`, new URL(`image/${p.name}`, ASSETS).href])
-      : [['工具链', URLS.rootfs]];
-    for (const [label, url] of [['内核', URLS.kernel], ...rootfsChecks]) {
-      const r = await fetch(url, { method: 'HEAD' });
-      if (!r.ok) throw new Error(`${label}缺失（HTTP ${r.status}）`);
+    //
+    // 但**本地缓存命中时跳过这些探测** —— 那意味着不必联网也能开工（离线可用），
+    // 也省掉 3 次 HEAD 往返。
+    const manifest = await loadManifest();
+    const cachedEntry = await getCachedRootfs();
+    if (!cacheEntryMatches(cachedEntry, manifest)) {
+      const rootfsChecks = manifest?.parts?.length
+        ? manifest.parts.map((p) => [`工具链分段 ${p.name}`, new URL(`image/${p.name}`, ASSETS).href])
+        : [['工具链', URLS.rootfs]];
+      for (const [label, url] of [['内核', URLS.kernel], ...rootfsChecks]) {
+        const r = await fetch(url, { method: 'HEAD' });
+        if (!r.ok) throw new Error(`${label}缺失（HTTP ${r.status}）`);
+      }
     }
   } catch (e) {
     setPhase('err', '镜像缺失');
     writeLine(`\n✗ ${e.message}`);
-    writeLine('\n还没有生成虚拟机镜像。请在项目根目录运行：');
+    writeLine('\n还没有生成虚拟机镜像，或者网络拿不到它。请在项目根目录运行：');
     writeLine('    python tools/make-image.py');
     writeLine('\n该脚本用 Debian i386 的 arm-none-eabi-gcc 组装工具链，不需要 Docker。');
     setBusy(false);
@@ -428,9 +667,9 @@ async function boot() {
     writeLine('\n✓ 虚拟机已启动');
 
     if (!rootfsCache) {
-      writeLine('正在下载工具链镜像 …');
+      writeLine('正在准备工具链镜像 …');
       rootfsCache = await loadRootfs();
-      writeLine(`  收到 ${fmtBytes(rootfsCache.length)}`);
+      writeLine(`  镜像就绪：${fmtBytes(rootfsCache.length)}`);
     }
 
     const info = await vm.installToolchain(rootfsCache);
@@ -443,9 +682,21 @@ async function boot() {
     }
     writeLine('\n✓ 工具链已装入虚拟机');
 
-    state.template = await vm.listProjectFiles();
+    // 引擎预编译归档不当"用户文件"看：二进制、体积大、不需要进编辑器
+    state.template = (await vm.listProjectFiles()).filter((n) => !ENGINE_FILES.includes(n));
     state.overrides.clear();
     state.selected = null;
+    state.editorBase = null;
+    // 顺手记下模板自带的 Makefile（镜像里那份）：导入 demo 包时用来判断
+    // 「这份 Makefile 是模板的还是用户自己的」—— 见 isTemplateMakefile
+    state.templateMakefiles = [];
+    if (state.template.includes('Makefile')) {
+      try {
+        state.templateMakefiles.push(await vm.readProjectFile('Makefile'));
+      } catch {
+        /* 读不到就算了，isTemplateMakefile 还有站点那份兜底 */
+      }
+    }
     renderFiles();
 
     setPhase('ready', '环境就绪');
@@ -467,6 +718,8 @@ async function build() {
   if (state.phase !== 'ready' || state.busy) return;
   setBusy(true);
   state.artifact = null;
+  state.engineRebuilt = false; // 本轮是否重建引擎归档，由编译日志识别
+  state.nothingToDo = false; // 本轮 make 是否什么都没做（产物沿用上一次那份）
   el.btnDownload.disabled = true;
   el.btnPack.disabled = true;
   saveEditor();
@@ -480,11 +733,52 @@ async function build() {
   writeLine(`\n===== 开始编译 ${app} =====`);
 
   try {
-    const files = Object.fromEntries(state.overrides);
+    // 只推真正变过的文件：从模板原样读进编辑器、没改过的那些，虚拟机里本来就是
+    // 同一份字节，再推一遍纯属浪费（见 fromGuest 的说明）。
+    const files = Object.fromEntries(
+      [...state.overrides].filter(([n]) => !state.fromGuest.has(n))
+    );
     // 用户没自带 Makefile 时，注入站点上最新的模板 Makefile（镜像里可能是旧版）
     if (!files['Makefile']) {
       const mk = await getTemplateMakefile();
       if (mk) files['Makefile'] = mk;
+    } else {
+      writeLine('  使用工程里的 Makefile（未注入站点上的模板）');
+    }
+
+    /*
+     * 这份 Makefile 带不带「引擎预编译归档」逻辑，直接决定这轮是 3 秒还是
+     * 3 分钟 —— 明说出来，别让人对着一个耗时数字猜。
+     * （常见来由：把一个带旧版 Makefile 的工程包/旧 demo 包拖了进来。）
+     */
+    const mkDecoded = files['Makefile'] ? new TextDecoder().decode(files['Makefile']) : '';
+    if (mkDecoded && !MK_ENGINE_RE.test(mkDecoded)) {
+      writeLine('  ⚠ 这份 Makefile 没有引擎预编译逻辑 → 本次会全量编译 src/ 下的运行时（约 2~3 分钟）');
+      writeLine('    不是你特意改的话，点「恢复模板」再编译一次（会换回站点上的模板 Makefile）');
+    }
+
+    /*
+     * 推进引擎预编译归档 —— 编译从 207s 降到 3s 就靠它。
+     *
+     * 无论用户有没有改过 src/ 都推：一致性由 Makefile 的摘要校验兜底 ——
+     * 源码一样就命中快路径，源码不同就自动重建（≈190s）。
+     * 所以这里推错了最多多花一次校验，不会编出错的产物；反过来「用户动过 src/
+     * 就不推」会让「上传整份工程/整包 demo」这种常见操作每次都白重建一次
+     * （哪怕上传的源码和镜像里的一模一样）。
+     */
+    if (!state.enginePushed) {
+      const artifacts = await getEngineArtifacts();
+      if (artifacts) {
+        let total = 0;
+        for (const [name, bytes] of artifacts) {
+          files[name] = bytes;
+          total += bytes.length;
+        }
+        state.enginePushed = true;
+        writeLine(`  引擎预编译归档 ${fmtBytes(total)} 已就绪 → 本次只编你的源码`);
+      } else {
+        writeLine('  ⚠ 站点上没有引擎预编译归档（mrp_demo/lib/libmrp_engine.a + .key），本次全量编译');
+      }
     }
 
     const res = await state.vm.build({
@@ -496,6 +790,7 @@ async function build() {
 
     if (!res.ok) {
       writeLine(`\n✗ 编译失败（make 返回 ${res.code}）`);
+      if (res.timing) writeLine(`  本轮已耗时 ${fmtTiming(res.timing)}`);
       writeLine('  可点右上角「复制错误」把报错行一次性拷走');
       setPhase('ready', '编译失败');
       return;
@@ -507,6 +802,12 @@ async function build() {
     setPhase('ready', '编译成功');
     const b = res.artifact.bytes;
     writeLine(`\n✓ 编译完成：${res.artifact.name}（${fmtBytes(b.length)}）`);
+    // 本轮编译耗时：总耗时后面跟分段明细，加起来正好是总耗时
+    if (res.timing) writeLine(`  本轮编译耗时 ${fmtTiming(res.timing)}`);
+    if (state.nothingToDo) {
+      writeLine('  注：make 认为虚拟机里的源码没有变化，没有重新编译 —— 产物就是上一次那份');
+      writeLine('      （导入过源码又点过「恢复模板」的话，恢复会把虚拟机里的工程目录一起换回来）');
+    }
     const isElf = b.length >= 4 && b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46;
     writeLine(isElf ? '  已确认为 ELF 可执行文件，可下载、可用「打包 .mrp」' : '  ⚠ 产物不是 ELF，请检查该文件');
   } catch (e) {
@@ -529,6 +830,70 @@ function downloadArtifact() {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
+/**
+ * 「下载demo」：**从虚拟机里现取内置模板**，打包成 zip 下载。
+ *
+ * 为什么不再放一个静态的 mrp_demo.zip：那个文件与镜像里的模板是两份东西，
+ * 改了模板忘了重新生成 zip，就会发出去一个和实际模板对不上的工程包
+ * （真发生过：zip 停在 9-16 那版，仓库的 src/ 已经是 9-17 的样子，
+ *  test-zip 那项「内容与磁盘文件一致」一直红着）。现在内容只有一个来源 ——
+ * 虚拟机里正在被编译的那份模板。
+ *
+ * 只在「已启动 + 模板没被改动」时能点（见 refreshDemoButton）：改过之后
+ * 取出来的就不是内置模板了，下下来只会误导人。
+ */
+async function downloadDemo() {
+  if (state.busy || state.phase !== 'ready' || !isTemplatePristine()) return;
+  const names = [...state.template].sort();
+  if (!names.length) {
+    writeLine('\n（模板文件列表是空的 —— 先重新点一次「启动编译环境」）');
+    return;
+  }
+
+  setBusy(true);
+  writeLine(`\n===== 打包 demo 工程包（${names.length} 个文件，取自虚拟机里的模板）=====`);
+  try {
+    const files = [];
+    for (let i = 0; i < names.length; i++) {
+      const n = names[i];
+      // 从模板读进编辑器、没动过的那些已在 overrides 里，字节与虚拟机里一致，
+      // 直接用可以省一次 9p 往返
+      const cached = state.fromGuest.has(n) ? state.overrides.get(n) : null;
+      files.push({ name: n, data: cached ?? (await state.vm.readProjectFile(n)) });
+      el.phase.textContent = `读取模板 ${i + 1}/${names.length}`;
+    }
+
+    el.phase.textContent = '压缩中 …';
+    const zip = await zipDeflate(files);
+
+    // 自检：用项目自己的 unzip 读回来核对条目数与每项长度 —— 打包器有问题
+    // 就别让用户下（和 .mrp 打包那条路一样，写完先验一遍）
+    const back = await unzip(zip);
+    const bad = files.filter((f) => back[f.name]?.length !== f.data.length);
+    if (Object.keys(back).length !== files.length || bad.length) {
+      throw new Error(
+        `自检没通过：zip 里 ${Object.keys(back).length}/${files.length} 项` +
+          (bad.length ? `，${bad.slice(0, 3).map((f) => f.name).join('、')} 长度不符` : '')
+      );
+    }
+
+    const blob = new Blob([zip], { type: 'application/zip' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'mrp_demo.zip';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    writeLine(`✓ 已生成 mrp_demo.zip（${files.length} 个文件，${fmtBytes(zip.length)}），开始下载`);
+    writeLine('  自检：用项目自己的 zip 解析器读回，条目数与每项长度都对得上');
+  } catch (e) {
+    writeLine(`\n✗ 打包 demo 失败：${e.message}`);
+  } finally {
+    el.phase.textContent = '—';
+    setBusy(false);
+    el.console.scrollTop = el.console.scrollHeight;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 打包 .mrp
 // ---------------------------------------------------------------------------
@@ -542,6 +907,17 @@ function downloadArtifact() {
 const PACK_START = 'lib/start.mr';
 const PACK_CFUNCTION = 'lib/cfunction.ext';
 const PACK_ELF = 'bin.elf';
+/**
+ * 引擎预编译归档：src/ 下 19 个 mythroad 运行时源文件预先编好的静态库。
+ * 把它推进虚拟机之后，一次构建只剩「编你自己的代码 + 链接」——
+ * 实测 207s → 3.1s，产物逐字节一致。详见 mrp_demo/Makefile 里的说明。
+ * 站点上不存在时（file:// 打开、或没部署）静默跳过：Makefile 会退回全量编译。
+ */
+const ENGINE_A = 'lib/libmrp_engine.a';
+// 归档的内容摘要（src/ 的 .c+.h + 编译参数的 sha256）：Makefile 靠它判断归档
+// 是否与源码一致，对不上就自己重建 —— 所以一致性不依赖前端的推送行为。
+const ENGINE_KEY = 'lib/libmrp_engine.key';
+const ENGINE_FILES = [ENGINE_A, ENGINE_KEY];
 // 资源 / 二进制的判定规则放在 mrp-pack.js 里，与命令行打包器共用
 
 function gbkInfo(str) {
@@ -896,6 +1272,7 @@ async function doPack() {
 el.btnBoot.onclick = boot;
 el.btnBuild.onclick = build;
 el.btnDownload.onclick = downloadArtifact;
+el.btnDemo.onclick = downloadDemo;
 el.btnClear.onclick = clearConsole;
 el.btnPack.onclick = openPackDialog;
 el.btnPackCancel.onclick = closePackOverlay;
@@ -1045,17 +1422,75 @@ el.btnCopyErrors.onclick = () => {
   copyWithFeedback(el.btnCopyErrors, errs);
 };
 
-el.btnReset.onclick = () => {
+/**
+ * 只清前端这份工程状态（不动虚拟机）：overrides / 勾选 / 编辑器 / 入口名。
+ * 「恢复模板」要同时清它和虚拟机里的工程目录 —— 见 resetToTemplate()。
+ */
+function clearClientProject() {
   state.overrides.clear();
+  state.fromGuest.clear();
   state.uploaded.clear();
   state.shell.clear();
   state.packRes.clear();
   state.packResTouched = false;
   state.selected = null;
+  state.editorBase = null;
   el.editor.value = '';
   el.editorHint.textContent = '未选择文件';
+  // 入口源文件也回默认：导入的 main.c 之所以会让「恢复」看起来没生效，
+  // 一半原因就是这个输入框还停在 main.c 上
+  el.optApp.value = 'helloworld.c';
   renderFiles();
-};
+}
+
+/**
+ * 恢复模板。
+ *
+ * ⚠ 必须连**虚拟机里的工程目录**一起还原：工程目录是用户唯一会往里写东西的地方，
+ * 只清前端那份状态的话，用户的 main.c / src/xxx.c 还留在 guest 里 ——
+ * make 会照样拿它们编译，而且因为依赖都比 bin.elf 旧，直接回一句
+ * `Nothing to be done for 'all'`，把上一次的产物当成新产物交出来
+ * （实测踩到：导入源码编译 → 点恢复模板 → 再编译，0.3 秒「编译完成」）。
+ *
+ * 虚拟机里那份模板副本是装工具链时 `cp -a` 留的，换回来只要 0.2 秒。
+ * 本来就没改动过（前端 pristine）就不必折腾虚拟机。
+ */
+async function resetToTemplate() {
+  if (state.busy) return;
+  const vm = state.vm;
+  const dirty = !isTemplatePristine();
+  clearClientProject();
+
+  if (!vm) {
+    writeLine('\n已重置界面状态（编译环境还没启动，虚拟机里没有东西要还原）');
+    return;
+  }
+  if (!dirty) {
+    writeLine('\n工程本来就没被改动过，只重置了界面状态');
+    return;
+  }
+
+  setBusy(true);
+  writeLine('\n===== 恢复模板：把虚拟机里的工程目录换回内置模板 =====');
+  try {
+    await vm.resetProject();
+    // lib/ 里的引擎预编译归档也一起被换掉了 → 下次编译要重新推（否则会白重建一次）
+    state.enginePushed = false;
+    // 上一次的产物已经不属于这个工程了：别让「下载 bin.elf / 打包 .mrp」还拿着它
+    state.artifact = null;
+    el.btnDownload.disabled = true;
+    refreshPackButton();
+    writeLine('✓ 已恢复：虚拟机里的工程目录换回了镜像内置那份（含 bin.elf 一起清掉）');
+    writeLine('  再点「编译」会真正重新编译模板工程');
+  } catch (e) {
+    writeLine(`\n✗ ${e.message}`);
+    writeLine('  可以点「启动编译环境」重启虚拟机，效果一样');
+  } finally {
+    setBusy(false);
+  }
+}
+
+el.btnReset.onclick = resetToTemplate;
 
 el.editor.addEventListener('input', () => {
   clearTimeout(el.editor._t);
@@ -1102,60 +1537,152 @@ function stripCComments(src) {
     .replace(/\/\/[^\n]*/g, '');
 }
 
-/** 如果所有路径都以同一个顶层目录开头，返回该目录（含斜杠），否则返回空串 */
-function commonRoot(names) {
-  if (!names.length) return '';
-  const first = names[0].split('/')[0];
-  if (!first || !names.every((n) => n.startsWith(first + '/'))) return '';
-  return first + '/';
-}
+/**
+ * 把一批外来文件铺进工程。
+ *
+ * @param {File[]} fileList 选择文件 / 拖拽 / 选择文件夹 拿到的 File 列表
+ * @param {{fromFolder?: boolean}} [opts] `fromFolder=true` 时按 `webkitRelativePath`
+ *        取路径（「选择文件夹」用），公共顶层目录名由 `relativeNames()` 剥掉。
+ *
+ * 两种来源的差别只有一处：**文件夹导入不解压 `.zip`** —— 一个装着发布包的
+ * 工程目录整个铺进来时，不该顺手把里面的 zip 炸开；要解压就单独把 zip 拖进来。
+ *
+ * 路径规则（剥公共顶层目录、跳过哪些垃圾文件）在 assets/ingest.js，
+ * 与单测共用同一份实现。
+ */
+async function ingestFiles(fileList, { fromFolder = false } = {}) {
+  let items;
+  // 按选中目录里的 .gitignore 判定要跳过的（只对「选择文件夹」生效）
+  let giIgnored = new Set();
+  let giDirs = [];
+  if (fromFolder) {
+    // webkitRelativePath 形如 "myapp/src/base.c"：剥掉选中目录名后，
+    // 剩下的相对路径就是工程内的路径
+    const raw = [...fileList].map((f) => f.webkitRelativePath || f.name);
+    const names = relativeNames(raw);
+    items = [...fileList].map((f, i) => ({ f, name: names[i] }));
 
-async function ingestFiles(fileList) {
+    /*
+     * 先读 .gitignore —— 多数人不想把 node_modules / build / dist 这类
+     * 「本来就不入库」的东西铺进工程，而它们恰恰写在 .gitignore 里。
+     * .gitignore 自身是隐藏文件、不会进工程（isJunkEntry 会跳过它），
+     * 但它的规则要遵守；子目录里的 .gitignore 也一起读（越深越优先）。
+     */
+    const gis = [];
+    const giErrors = [];
+    for (const it of items) {
+      const n = it.name;
+      if (!n || gis.length >= 20 || !/(^|\/)\.gitignore$/.test(n)) continue;
+      try {
+        const dir = n.includes('/') ? n.slice(0, n.lastIndexOf('/')) : '';
+        gis.push({ dir, rules: parseGitignore(await it.f.text()) });
+      } catch (e) {
+        // 读不了就跳过这一份，但要说出来 —— 否则「规则怎么没生效」要查半天
+        giErrors.push(`${n}（${e.message}）`);
+      }
+    }
+    if (giErrors.length) {
+      writeLine(`  ⚠ ${giErrors.length} 份 .gitignore 没读成功：${giErrors.join('、')}；本次不按它过滤`);
+    }
+    if (gis.some((g) => g.rules.length)) {
+      giIgnored = applyGitignore(items.map((it) => it.name), gis);
+      if (giIgnored.size) {
+        // 排序后取前几个：日志与文件顺序无关，同一份工程每次都一样
+        giDirs = [...new Set([...giIgnored].map((n) => n.split('/')[0]))].sort().slice(0, 4);
+      }
+    }
+  } else {
+    items = [...fileList].map((f) => ({ f, name: f.name }));
+  }
+
+  // 被跳过的分两类报给用户：系统/隐藏文件（外层的 + zip 内部的）、.gitignore 命中项
+  const requested = items.length;
+  let skipped = 0;
+  let giSkipped = 0;
+  const keptItems = [];
+  for (const it of items) {
+    if (!it.name || isJunkEntry(it.name)) {
+      skipped++;
+      continue;
+    }
+    if (giIgnored.has(it.name)) {
+      giSkipped++;
+      continue;
+    }
+    keptItems.push(it);
+  }
+  items = keptItems;
+
   const plain = [];
   let zipCount = 0;
   let zipFiles = 0;
   let detectedEntry = null;
 
-  for (const f of fileList) {
-    if (!/\.zip$/i.test(f.name)) {
-      plain.push(f);
+  for (const it of items) {
+    if (fromFolder || !/\.zip$/i.test(it.name)) {
+      plain.push(it);
       continue;
     }
 
     // zip 源码包：解开铺进工程，并顺手判断入口源文件
     let entries;
     try {
-      entries = await unzip(new Uint8Array(await f.arrayBuffer()));
+      entries = await unzip(new Uint8Array(await it.f.arrayBuffer()));
     } catch (e) {
-      writeLine(`\n✗ 解开 ${f.name} 失败：${e.message}`);
+      writeLine(`\n✗ 解开 ${it.name} 失败：${e.message}`);
       continue;
     }
 
-    const skip = (n) =>
-      n.startsWith('__MACOSX/') || /(^|\/)(\.DS_Store|Thumbs\.db)$/i.test(n);
-    const rawNames = Object.keys(entries).filter((n) => !skip(n));
-    const prefix = commonRoot(rawNames);
-    const names = rawNames.map((n) => (prefix ? n.slice(prefix.length) : n));
+    const rawNames = Object.keys(entries);
+    const keptNames = rawNames.filter((n) => !isJunkEntry(n));
+    skipped += rawNames.length - keptNames.length;
+    const names = relativeNames(keptNames);
 
     const contents = {};
     for (let i = 0; i < names.length; i++) {
-      const data = entries[rawNames[i]];
+      const data = entries[keptNames[i]]; // 与 names 一一对应（keptNames 才是过滤后的）
       contents[names[i]] = data;
+      // demo 包里带回来的模板 Makefile 不当「用户文件」看（见 isTemplateMakefile）：
+      // 否则它会挡住站点上那份（带引擎预编译逻辑）的注入 → 之后每次编译都全量重编。
+      if (await isTemplateMakefile(names[i], data)) {
+        state.overrides.delete(names[i]);
+        state.uploaded.delete(names[i]);
+        state.fromGuest.add(names[i]);
+        continue;
+      }
       state.overrides.set(names[i], data);
+      state.fromGuest.delete(names[i]); // 外来内容，内容和虚拟机里那份无关，要推
       state.uploaded.add(names[i]);
     }
 
     zipCount++;
     zipFiles += names.length;
-    detectedEntry = detectEntrySource(
+    const picked = detectEntrySource(
       names.filter((n) => /\.c$/i.test(n)),
       contents
     );
+    if (picked) detectedEntry = picked;
   }
 
-  for (const f of plain) {
-    state.overrides.set(f.name, new Uint8Array(await f.arrayBuffer()));
-    state.uploaded.add(f.name);
+  // 普通文件（含「选择文件夹」铺进来的）：顺便看一眼哪个是入口源文件。
+  // 候选按名字排一遍，免得结果随操作系统的目录顺序变（同一份工程每次导入都一样）。
+  const cContents = {};
+  for (const it of plain) {
+    const data = new Uint8Array(await it.f.arrayBuffer());
+    if (/\.c$/i.test(it.name)) cContents[it.name] = data;
+    if (await isTemplateMakefile(it.name, data)) {
+      state.overrides.delete(it.name);
+      state.uploaded.delete(it.name);
+      state.fromGuest.add(it.name);
+      continue;
+    }
+    state.overrides.set(it.name, data);
+    state.fromGuest.delete(it.name);
+    state.uploaded.add(it.name);
+  }
+  if (!detectedEntry) {
+    const cFiles = Object.keys(cContents).sort();
+    if (cFiles.length) detectedEntry = detectEntrySource(cFiles, cContents);
   }
 
   // 有新资源进来就重算默认勾选
@@ -1165,14 +1692,24 @@ async function ingestFiles(fileList) {
 
   if (zipCount) {
     writeLine(`\n已解开 ${zipCount} 个 zip 包，共 ${zipFiles} 个文件铺进工程`);
-    if (detectedEntry) {
-      el.optApp.value = detectedEntry;
-      writeLine(`  入口源文件已自动设为 ${detectedEntry}`);
-    } else {
-      writeLine('  没找到 main.c 或带 main() 的源文件，入口保持 helloworld.c');
-    }
+  } else if (fromFolder) {
+    writeLine(`\n已从文件夹读取 ${plain.length} 个文件铺进工程（编译时同步进虚拟机）`);
   } else {
     writeLine(`\n已载入 ${plain.length} 个文件到工程（编译时同步进虚拟机）`);
+  }
+  const skippedParts = [];
+  if (skipped > 0) skippedParts.push(`系统/隐藏文件 ${skipped} 个（.git、.DS_Store 之类）`);
+  if (giSkipped > 0) {
+    skippedParts.push(
+      `.gitignore 命中 ${giSkipped} 项（${giDirs.join('、')}${giDirs.length ? ' 等' : ''}）`
+    );
+  }
+  if (skippedParts.length) writeLine(`  已跳过：${skippedParts.join('；')}`);
+  if (detectedEntry) {
+    el.optApp.value = detectedEntry;
+    writeLine(`  入口源文件已自动设为 ${detectedEntry}`);
+  } else if (zipCount) {
+    writeLine('  没找到 main.c 或带 main() 的源文件，入口保持 helloworld.c');
   }
   const res = [...state.overrides.keys()].filter(isResourceCandidate);
   if (res.length) writeLine(`  其中 ${res.length} 个是资源，打包 .mrp 时会默认带上`);
@@ -1184,6 +1721,12 @@ async function ingestFiles(fileList) {
 el.fileInput.onchange = () => {
   if (el.fileInput.files?.length) ingestFiles([...el.fileInput.files]);
   el.fileInput.value = '';
+};
+
+// 「选择文件夹」：按 webkitRelativePath 还原目录结构铺进工程（跳过 .git 等隐藏项）
+el.dirInput.onchange = () => {
+  if (el.dirInput.files?.length) ingestFiles([...el.dirInput.files], { fromFolder: true });
+  el.dirInput.value = '';
 };
 
 ['dragenter', 'dragover'].forEach((ev) =>
@@ -1199,8 +1742,29 @@ el.fileInput.onchange = () => {
   })
 );
 el.drop.addEventListener('drop', (e) => {
-  const files = e.dataTransfer?.files;
-  if (files?.length) ingestFiles([...files]);
+  /*
+   * 拖拽只能拿到「条目」，文件夹要递归读 —— 这里不做，只识别出来提示用
+   * 「选择文件夹」按钮：否则它会被当成一个 0 字节的普通文件塞进工程
+   * （名字就是文件夹名）。
+   * 取文件仍然走 dataTransfer.files（原路径，最稳），只在检测到文件夹时
+   * 把同名 0 字节的条目排掉。
+   */
+  const dirNames = new Set();
+  for (const it of e.dataTransfer?.items || []) {
+    if (it.kind !== 'file') continue;
+    const entry = it.webkitGetAsEntry?.();
+    if (entry?.isDirectory) dirNames.add(entry.name);
+  }
+  if (dirNames.size) {
+    writeLine(
+      `\n检测到 ${dirNames.size} 个文件夹（${[...dirNames].join('、')}）—— 拖拽请用 zip 包，` +
+        '整个文件夹请点左上角「选择文件夹」'
+    );
+  }
+  const files = [...(e.dataTransfer?.files || [])].filter(
+    (f) => !(f.size === 0 && dirNames.has(f.name))
+  );
+  if (files.length) ingestFiles(files);
 });
 
 // 初始状态

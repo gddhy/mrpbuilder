@@ -34,6 +34,8 @@ const rootfsPath = need(path.join(IMGDIR, 'rootfs.tar.gz'), '请先运行：pyth
 
 const mod = await import(pathToFileURL(path.join(V86DIR, 'libv86.js')).href);
 const { MrpVm } = await import(pathToFileURL(path.join(ROOT, 'assets', 'vm.js')).href);
+const { fmtDuration } = await import(pathToFileURL(path.join(ROOT, 'assets', 'bytes.js')).href);
+const { zipDeflate, unzip } = await import(pathToFileURL(path.join(ROOT, 'assets', 'zip.js')).href);
 void mod; // v86 由 vm.js 内部导入
 
 const args = process.argv.slice(2);
@@ -71,6 +73,11 @@ try {
   });
   console.log(`\n[vm] 工具链就绪，累计 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
+  // 和界面一样：启动完先把内置模板清单记下来（「下载demo」用的就是这一份；
+  // 编译之后工程目录里会多出 bin.elf / 引擎归档，那已经不是"内置模板"了）
+  const template = (await vm.listProjectFiles()).filter((n) => !n.includes('libmrp_engine.'));
+  console.log(`[vm] 内置模板 ${template.length} 个文件`);
+
   if (customCmd) {
     const rc = await vm.run(customCmd, { timeout: 900_000 });
     console.log(`\n[vm] 命令退出码 ${rc}`);
@@ -103,12 +110,48 @@ try {
       console.log(`[vm] 额外投入源码 ${path.basename(src)}`);
     }
 
+    // 镜像里那份模板 Makefile 是打镜像那一刻的版本，可能还没有引擎归档逻辑，
+    // 所以和 assets/app.js 一样：先推站点上最新的 Makefile 覆盖它。
+    const mkPath = path.join(ROOT, 'mrp_demo', 'Makefile');
+    if (fs.existsSync(mkPath)) {
+      files['Makefile'] = new Uint8Array(fs.readFileSync(mkPath));
+      console.log('[vm] 投入 mrp_demo/Makefile（站点最新版，覆盖镜像里的）');
+    }
+
+    // 引擎预编译归档 + 内容摘要：与 assets/app.js 的推送方式保持一致
+    // （两个都推才走快路径 3 秒；只推 .a 会被摘要校验判成过期，在虚拟机里重编 ≈190 秒）。
+    const engineDir = path.join(ROOT, 'mrp_demo', 'lib');
+    for (const name of ['libmrp_engine.a', 'libmrp_engine.key']) {
+      const p = path.join(engineDir, name);
+      if (fs.existsSync(p)) {
+        files[`lib/${name}`] = new Uint8Array(fs.readFileSync(p));
+        console.log(`[vm] 投入 ${`lib/${name}`}（${(fs.statSync(p).size / 1024).toFixed(0)} KiB）`);
+      } else {
+        console.log(`[vm] ⚠ 没有 mrp_demo/lib/${name} —— 本次会在虚拟机里全量重编引擎`);
+        console.log('[vm]   生成它：node tools/make-engine-lib.mjs');
+        break;
+      }
+    }
+
     const res = await vm.build({
       files,
       app: process.env.APP || 'helloworld.c',
       target: process.env.TARGET || 'bin.elf',
       extra: process.env.EXTRA || '',
     });
+    // 与界面同一套口径（assets/bytes.js 的 fmtDuration），别各自再写一份
+    if (res.timing) {
+      const t = res.timing;
+      console.log(
+        `[vm] 编译耗时 ${fmtDuration(t.totalMs)}` +
+          `（同步源码 ${fmtDuration(t.syncMs)} · 编译 ${fmtDuration(t.compileMs)} · 取回产物 ${fmtDuration(t.artifactMs)}）`
+      );
+      console.log(
+        t.compileMs < 30_000
+          ? '[vm]   → 走的是引擎预编译归档（快路径）'
+          : '[vm]   → 在虚拟机里全量重编了引擎（慢路径），检查 Makefile / 归档有没有推成功'
+      );
+    }
 
     if (!res.ok) {
       console.log(`\n[vm] ✗ 编译失败（make 返回 ${res.code}）`);
@@ -120,6 +163,30 @@ try {
       console.log(`\n[vm] ✓ 编译成功，产物 ${out}（${res.artifact.bytes.length} 字节）`);
       console.log(`[vm] 校验：python tools/check-elf.py ${out}`);
       console.log(`[vm] 总用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+      // ---- 复现界面「下载demo」那条路：从虚拟机现取模板 → 打包 → 读回核对 ----
+      console.log(`\n[vm] 打包 demo 工程包（从虚拟机取 ${template.length} 个模板文件）…`);
+      const tDemo = Date.now();
+      const demoFiles = [];
+      for (const n of [...template].sort()) {
+        demoFiles.push({ name: n, data: await vm.readProjectFile(n) });
+      }
+      const demoZip = await zipDeflate(demoFiles);
+      const demoBack = await unzip(demoZip);
+      const badDemo = demoFiles.filter((f) => demoBack[f.name]?.length !== f.data.length);
+      const rawBytes = demoFiles.reduce((n, f) => n + f.data.length, 0);
+      const demoOk = Object.keys(demoBack).length === demoFiles.length && !badDemo.length;
+      console.log(
+        `[vm] demo 包：${demoFiles.length} 个文件，${(rawBytes / 1024).toFixed(0)} KiB → ` +
+          `${(demoZip.length / 1024).toFixed(0)} KiB，用时 ${fmtDuration(Date.now() - tDemo)}`
+      );
+      console.log(
+        demoOk
+          ? '[vm]   自检：用项目自己的 zip 解析器读回，条目数与每项长度一致 ✓'
+          : `[vm]   ✗ 自检失败：${Object.keys(demoBack).length}/${demoFiles.length} 项` +
+            (badDemo.length ? `，长度不符 ${badDemo.slice(0, 3).map((f) => f.name).join('、')}` : '')
+      );
+      if (!demoOk) process.exitCode = 1;
     }
   }
 } catch (e) {

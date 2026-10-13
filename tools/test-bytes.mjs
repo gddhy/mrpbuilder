@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const { isGzip, looksLikeTar, gzipBytes, fmtBytes } = await import(
+const { isGzip, looksLikeTar, gzipBytes, fmtBytes, fmtDuration } = await import(
   pathToFileURL(path.join(ROOT, 'assets', 'bytes.js')).href
 );
 
@@ -100,6 +100,25 @@ for (const [n, want] of sizeCases) {
 ok('null 不炸、返回空串', fmtBytes(null) === '');
 // 中间量级以前会显示成 "0.0 MB"，这里专门钉一下
 ok('10KB~1MB 之间不会显示成 0.0 MB', !fmtBytes(500000).includes('0.0'));
+
+console.log("\n===== fmtDuration 耗时文案 =====");
+// 编译耗时统计（「编译完成」那一行）就靠它，「x 分 y 秒」在慢路径下要能正确进位
+const durCases = [
+  [0, '0.0 秒'],
+  [880, '0.9 秒'],
+  [3100, '3.1 秒'],
+  [8800, '8.8 秒'],
+  [59500, '59.5 秒'],
+  [60000, '1 分 0.0 秒'],
+  [60800, '1 分 0.8 秒'],
+  [190000, '3 分 10.0 秒'],
+  [601000, '10 分 1.0 秒'],
+];
+for (const [ms, want] of durCases) {
+  const got = fmtDuration(ms);
+  ok(`${String(ms).padStart(7)} ms → ${want}`, got === want, got === want ? '' : `实际 ${got}`);
+}
+ok('undefined/负数不炸（返回 0.0 秒）', fmtDuration(undefined) === '0.0 秒' && fmtDuration(-5) === '0.0 秒');
 
 console.log(`\n${failed ? `${failed} 项失败` : '全部通过'}`);
 process.exit(failed ? 1 : 0);

@@ -3,8 +3,10 @@
  *
  * 读：解析 EOCD + central directory，store 与 deflate 两种压缩都支持
  *     （deflate 用平台自带的 DecompressionStream('deflate-raw')）。
- * 写：只做 store（不压缩），用于把工程打包成 zip 供下载 ——
- *     工程源码本来就小（<2MB），store 足够，而且实现短、不会出兼容性问题。
+ * 写：两种都给 —— `zipStore()` 不压缩（内容已压过、或必须逐字节原样时用），
+ *     `zipDeflate()` 走 deflate（「下载 demo 工程包」用它：1.3 MB → ~360 KB）。
+ *     框架部分（local header / central directory / EOCD）两份共用 assembleZip()，
+ *     免得两个实现慢慢走偏。
  *
  * 读的部分最早写在 experiments/wasi-runtime/vfs.js 里，那里已经验证过
  * 能正确解开工具链 zip；搬到正式模块是为了给「上传 zip 源码包」用。
@@ -87,12 +89,58 @@ function crc32(bytes) {
 }
 
 /**
- * 打包成 zip（store）。
+ * 打包成 zip（store，不压缩）。
+ * 用于「内容已经压过、或必须逐字节原样」的场合。工程源码包请用 zipDeflate()。
  * @param {Array<{name: string, data: Uint8Array}>} files
  * @returns {Uint8Array}
  */
 export function zipStore(files) {
   const enc = new TextEncoder();
+  const entries = files.map((f) => {
+    const data = f.data instanceof Uint8Array ? f.data : new Uint8Array(f.data);
+    return { nameBytes: enc.encode(f.name), crc: crc32(data), packed: data, raw: data.length };
+  });
+  return assembleZip(entries, 0);
+}
+
+/** raw-deflate 一段字节（浏览器与 Node 18+ 都内置 CompressionStream） */
+async function deflateRaw(bytes) {
+  if (typeof CompressionStream !== 'function') {
+    throw new Error('当前环境没有 CompressionStream，无法压缩 zip');
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * 打包成 zip（deflate 压缩）。
+ * 给「下载 demo 工程包」用：模板约 1.3 MB，store 会原样塞进去，
+ * deflate 之后约 360 KB —— 下载体积差 3 倍多，值得。
+ * @param {Array<{name: string, data: Uint8Array}>} files
+ * @returns {Promise<Uint8Array>}
+ */
+export async function zipDeflate(files) {
+  const enc = new TextEncoder();
+  const entries = [];
+  for (const f of files) {
+    const data = f.data instanceof Uint8Array ? f.data : new Uint8Array(f.data);
+    entries.push({
+      nameBytes: enc.encode(f.name),
+      crc: crc32(data),
+      packed: await deflateRaw(data),
+      raw: data.length,
+    });
+  }
+  return assembleZip(entries, 8);
+}
+
+/**
+ * 按 zip 结构把条目拼成字节流 —— store / deflate 只差一个 method 和压没压过，
+ * 框架部分共用一份，避免两份实现走偏。
+ * @param {Array<{nameBytes:Uint8Array, crc:number, packed:Uint8Array, raw:number}>} entries
+ * @param {number} method 0=store，8=deflate
+ */
+function assembleZip(entries, method) {
   const chunks = [];
   const central = [];
   let offset = 0;
@@ -105,12 +153,10 @@ export function zipStore(files) {
   const u32 = (v) =>
     new Uint8Array([v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
 
-  for (const f of files) {
-    const data = f.data instanceof Uint8Array ? f.data : new Uint8Array(f.data);
-    const nameBytes = enc.encode(f.name);
-    const crc = crc32(data);
-    const crcBytes = u32(crc);
-    const sizeBytes = u32(data.length);
+  for (const e of entries) {
+    const crcBytes = u32(e.crc);
+    const packedSize = u32(e.packed.length);
+    const rawSize = u32(e.raw);
 
     // ⚠ 必须在写 local header 之前记下起始偏移；
     //    写完再记会变成"条目结束位置"，读回来全错（实际踩过）。
@@ -120,18 +166,18 @@ export function zipStore(files) {
     push(u32(0x04034b50));
     push(u16(20)); // version needed
     push(u16(0x0800)); // flags：UTF-8 文件名
-    push(u16(0)); // method = store
+    push(u16(method));
     push(u16(0)); // mtime
     push(u16(0x21)); // mdate（1980-01-01，合法最小值）
     push(crcBytes);
-    push(sizeBytes);
-    push(sizeBytes);
-    push(u16(nameBytes.length));
+    push(packedSize);
+    push(rawSize);
+    push(u16(e.nameBytes.length));
     push(u16(0)); // extra len
-    push(nameBytes);
-    push(data);
+    push(e.nameBytes);
+    push(e.packed);
 
-    central.push({ nameBytes, crcBytes, sizeBytes, offset: start });
+    central.push({ ...e, crcBytes, packedSize, rawSize, offset: start });
   }
 
   const centralStart = offset;
@@ -140,12 +186,12 @@ export function zipStore(files) {
     push(u16(20)); // version made by
     push(u16(20)); // version needed
     push(u16(0x0800));
-    push(u16(0));
+    push(u16(method));
     push(u16(0));
     push(u16(0x21));
     push(c.crcBytes);
-    push(c.sizeBytes);
-    push(c.sizeBytes);
+    push(c.packedSize);
+    push(c.rawSize);
     push(u16(c.nameBytes.length));
     push(u16(0)); // extra
     push(u16(0)); // comment
@@ -161,8 +207,8 @@ export function zipStore(files) {
   push(u32(EOCD_SIG));
   push(u16(0));
   push(u16(0));
-  push(u16(files.length));
-  push(u16(files.length));
+  push(u16(entries.length));
+  push(u16(entries.length));
   push(u32(centralSize));
   push(u32(centralStart));
   push(u16(0));

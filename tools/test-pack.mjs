@@ -17,10 +17,32 @@ const { packMrp, parseMrp, crc32, encodeGBK, decodeGBK, encodeGBKDetailed } = aw
   pathToFileURL(path.join(ROOT, 'assets', 'mrp-pack.js')).href
 );
 
-const SAMPLES = [
-  'C:/APP/2048/build_output/game2048.mrp',
-  'C:/APP/ai/demo/WasteLand_240.mrp',
-];
+/**
+ * 真实样本 mrp 的路径。
+ *
+ * 不写死在代码里（那会把本机的私有工程目录名带进公开仓库）。按下面的顺序找，
+ * 都没有就跳过这一段 —— 后面两段是合成样本，仍会照常跑：
+ *   1. 环境变量 MRP_SAMPLES，多个路径用 `;` 或 `:` 分隔
+ *   2. 工程根目录下的 samples/*.mrp
+ * 例：MRP_SAMPLES=/tmp/a.mrp:/tmp/b.mrp node tools/test-pack.mjs
+ *
+ * 这一段的价值：样本里的文件数据本来就是 gzip 过的，原样取出后用我们自己的容器
+ * 逻辑重新组装，产物应当与样本**逐字节一致** —— 比「能生成一个文件」强得多。
+ */
+const SAMPLES = (() => {
+  const fromEnv = (process.env.MRP_SAMPLES || '')
+    .split(/[;:]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+  const dir = path.join(ROOT, 'samples');
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((n) => /\.mrp$/i.test(n))
+    .sort()
+    .map((n) => path.join(dir, n));
+})();
 
 let failed = 0;
 function ok(name, pass, detail = '') {
@@ -39,9 +61,13 @@ function firstDiff(a, b) {
 }
 
 console.log('===== 1. 真实样本往返重打包（逐字节比对）=====');
+if (!SAMPLES.length) {
+  console.log('  · 跳过：没有提供真实 .mrp 样本');
+  console.log('    挑一份丢到 samples/ 下，或用 MRP_SAMPLES=<path>[:<path>…] 指定');
+}
 for (const p of SAMPLES) {
   if (!fs.existsSync(p)) {
-    ok(`样本存在 ${p}`, false, '（文件不存在，跳过）');
+    console.log(`  · 跳过不存在的样本 ${p}`);
     continue;
   }
   const orig = new Uint8Array(fs.readFileSync(p));
@@ -101,8 +127,8 @@ checkGBK();
 function checkGBK() {
   const cases = [
     ['中', [0xd6, 0xd0]],
-    ['废土拾荒录文字生存RPG游戏', null],
-    ['2048益智游戏', null],
+    ['示例游戏名称文字版', null],
+    ['小游戏样例', null],
     ['测试gcc编译', null],
     ['abcXYZ 0~9!@#', null],
     ['', []],
@@ -116,9 +142,9 @@ function checkGBK() {
       ok(`"${s}" 往返一致（${enc.length} 字节）`, back === s, back === s ? '' : `解回 ${JSON.stringify(back)}`);
     }
   }
-  // 样本里的中文名必须能编回去
-  const a = decodeGBK(encodeGBK('废土拾荒录'));
-  ok('样本中文名往返', a === '废土拾荒录', JSON.stringify(a));
+  // 中文名必须能编回去
+  const a = decodeGBK(encodeGBK('示例游戏'));
+  ok('中文名称往返', a === '示例游戏', JSON.stringify(a));
 
   // 不可编码字符要能报出来。
   // 注意 '★'(U+2605) 在 GBK 符号区里是有码位的（0xA1EE 附近），只有 '✓'(U+2713) 没有，

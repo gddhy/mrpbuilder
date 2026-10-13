@@ -1,12 +1,17 @@
 # 构建中间产物
 .build/
 
-# AI 工作区日志（含内网地址等，绝不入库）
+# AI 工作区日志（本机私有，绝不入库）
 .workbuddy/
+
+# test-pack.mjs 用的真实 .mrp 样本（各自私有，别入库）
+samples/
 
 # 编译产物
 mrp_demo/bin.elf
 mrp_demo/*.o
+# 引擎预编译归档的中转目录（make engine-archive 用完自己删，中断时会留下）
+mrp_demo/.engine-obj/
 
 # 命令行打包器（tools/pack-demo.mjs）的输出
 dist/

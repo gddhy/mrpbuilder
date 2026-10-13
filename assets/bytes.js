@@ -71,3 +71,17 @@ export function fmtBytes(n) {
   }
   return i === 0 ? `${v.toLocaleString()} B` : `${v.toFixed(1)} ${SIZE_UNITS[i]}`;
 }
+
+/**
+ * 人读的耗时（毫秒 → 文案），和 fmtBytes 一样只用于显示。
+ *   8.8     → "8.8 秒"        （1 分钟以内保留 1 位小数，编译快慢就看这个精度）
+ *   60800   → "1 分 0.8 秒"    （超过 1 分钟给「x 分 y 秒」，重建引擎那次要 3 分钟）
+ *   190000  → "3 分 10.0 秒"
+ *   负数/undefined → "0.0 秒"  （调用方不必先判空）
+ */
+export function fmtDuration(ms) {
+  const s = Math.max(0, Number(ms) || 0) / 1000;
+  if (s < 60) return `${s.toFixed(1)} 秒`;
+  const m = Math.floor(s / 60);
+  return `${m} 分 ${(s - m * 60).toFixed(1)} 秒`;
+}

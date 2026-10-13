@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MRP 纯前端编译环境 · v86 + arm-none-eabi-gcc</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="assets/style.css?v=20260917d">
+<link rel="stylesheet" href="assets/style.css?v=20261014a">
 <script>
   /*
    * 主题：在首次渲染之前把生效值打到 <html data-theme>，否则会先白一下再变深色。
@@ -57,8 +57,13 @@
           选择文件
           <input type="file" id="fileInput" multiple hidden>
         </label>
-        <a class="btn small" href="mrp_demo.zip" download="mrp_demo.zip"
-          title="下载内置示例工程的源码包（zip），可改完再拖回来">下载demo</a>
+        <label class="btn small"
+          title="选一个工程文件夹：文件按相对路径铺进工程；会读里面的 .gitignore 跳过 node_modules、build 这类不入库的东西，也自动跳过 .git 等隐藏项；文件夹里的 zip 不会被解开">
+          选择文件夹
+          <input type="file" id="dirInput" webkitdirectory directory multiple hidden>
+        </label>
+        <button id="btnDemo" class="btn small" disabled
+          title="先点「启动编译环境」——demo 工程包是现从虚拟机里的模板取的">下载demo</button>
         <button id="btnReset" class="btn small">恢复模板</button>
       </div>
     </div>
@@ -75,7 +80,7 @@
 
     <div id="drop" class="drop">
       把 .c / .h / 资源文件拖到这里，或点「选择文件」
-      <br><span class="muted">同名文件会覆盖镜像内置模板</span>
+      <br><span class="muted">整个文件夹用「选择文件夹」；同名文件会覆盖镜像内置模板</span>
     </div>
 
     <details class="opts" open>
@@ -203,12 +208,27 @@
         <ul>
           <li><b>导入单个文件</b>：点「选择文件」，或把 <code>.c</code> / <code>.h</code> /
             资源文件直接拖进页面。同名文件会覆盖内置模板。</li>
+          <li><b>导入整个文件夹</b>：点「选择文件夹」选一个工程目录 —— 里面的文件会按
+            <b>相对路径</b>铺进工程（你选中的那一级目录名会自动剥掉，和 zip 包同一条规则），
+            并自动判断入口源文件。<b>目录里有 <code>.gitignore</code> 就照它跳过</b>
+            （<code>node_modules/</code>、<code>build/</code>、<code>*.o</code> 这类本来就不入库的东西，
+            支持 <code>!</code> 取反与子目录里的 <code>.gitignore</code>）；
+            <code>.git</code>、<code>.DS_Store</code> 这类隐藏项也会跳过；
+            文件夹里的 <code>.zip</code> <b>不会被解开</b>（当普通文件加进来）——
+            要解压就把那个 zip 单独拖进来。拖拽不支持整个文件夹，请用这个按钮。</li>
           <li><b>导入 zip 工程包</b>：直接把 zip 拖进来就行 —— 会自动解压铺进工程，
             并自动判断入口源文件（优先 <code>main.c</code>，其次扫描含
             <code>main()</code> 的 <code>.c</code>）；整包只有一层顶层目录时会自动剥掉。</li>
           <li><b>下载 demo 工程</b>：点左侧「下载demo」，得到完整的示例工程 zip
             —— <b>里面带有 mythroad 运行时</b>（<code>src/</code> 的运行时源码 + <code>lib/</code> 壳文件），
-            可以在它基础上开发自己的 MRP 程序，改完再打包成 zip 拖回来。</li>
+            可以在它基础上开发自己的 MRP 程序，改完再打包成 zip 拖回来。
+            这个包是<b>现从虚拟机里的内置模板取的</b>，所以要先点「启动编译环境」；
+            而且只有在你<b>没改动过工程</b>时才能点 —— 改过之后下到的就不是内置模板了，
+            想恢复用「恢复模板」。</li>
+          <li><b>恢复模板</b>：把工程退回内置模板 —— 前端这份状态（编辑器、勾选、
+            入口名）和<b>虚拟机里的工程目录</b>都会还原（用户加的文件、改过的源码、
+            上次的 <code>bin.elf</code> 一并清掉），所以恢复之后再编译是<b>真正重编一次
+            模板工程</b>，不会拿旧产物糊弄。没有任何改动时点它只重置界面状态，不折腾虚拟机。</li>
         </ul>
       </li>
       <li>
@@ -238,6 +258,6 @@
   </div>
 </div>
 
-<script type="module" src="assets/app.js?v=20260917d"></script>
+<script type="module" src="assets/app.js?v=20261014f"></script>
 </body>
 </html>
