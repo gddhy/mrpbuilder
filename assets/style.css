@@ -27,6 +27,8 @@
   --console-text: #2c2c2a;
   --err-soft: #fdeaea;
   --err-ring: rgba(163, 45, 45, 0.14);
+  /* 输入框聚焦时那圈淡晕（跟着 --text 走：浅色下是墨色晕、深色下是浅色晕） */
+  --focus-ring: rgba(31, 31, 30, 0.18);
   /* 主题切换的时序（与主题无关、两套共用；改数字要同步 assets/theme.js 的 ANIM_MS） */
   --theme-fade: 0.28s;      /* 表面（背景 / 边框 / 投影）的渐变时长 */
   --theme-ink-delay: 0.12s; /* 文字与图标颜色"跳变"的时刻，理由见 :root.theme-anim 那段 */
@@ -57,6 +59,7 @@
   --console-text: #d7d5cd;
   --err-soft: #3a2020;
   --err-ring: rgba(240, 138, 138, 0.18);
+  --focus-ring: rgba(236, 235, 230, 0.22);
   color-scheme: dark;
 }
 
@@ -474,9 +477,15 @@ body {
 
 /*
  * 这里特意不用 <dialog>。
- * 原生 <dialog> 的模态靠"顶层渲染（top layer）+ backdrop"实现，行为依赖浏览器实现；
- * 在嵌入式 webview / 预览面板里实测出现过「弹窗里的输入框点不进去」的问题。
- * 改成普通覆盖层：定位、层级、显隐全部由我们自己控制，任何环境行为一致。
+ * 原生 <dialog> 的模态靠"顶层渲染（top layer）+ backdrop"实现，尺寸 / 层级 / 显隐
+ * 都交给 UA 决定、行为依赖浏览器实现；改成普通覆盖层后这些全由我们自己控制，
+ * 任何环境行为一致 —— 这条理由仍然成立。
+ *
+ * ⚠ 但「弹窗里的输入框点不进去」当年记成是 <dialog> 顶层渲染导致的，**归因错了**：
+ *   真正的根因是 v86 的鼠标适配器在整页无条件 preventDefault() 掉 mousedown
+ *   （默认行为里就包含"聚焦 + 落光标"）。详见 assets/vm.js 的 disable_mouse 说明，
+ *   以及 README「顺手修掉的七个 bug」第 6、7 条。换覆盖层本身没错，
+ *   但别再把"输入框点不进"算到 <dialog> 头上。
  */
 .overlay {
   position: fixed;
@@ -551,17 +560,24 @@ body {
   color: var(--text);
   width: 100%;
   resize: vertical;
-  /*
-   * 这两条是保险：显式声明"一定可以点、一定可以选"。
-   * 弹窗是 <dialog> 模态（顶层渲染），有些嵌入式预览面板 /
-   * 带覆盖层的宿主环境会影响命中与文本选择，显式声明能避免被外部样式波及。
-   */
-  pointer-events: auto;
-  user-select: text;
-  -webkit-user-select: text;
 }
+/*
+ * 输入框的聚焦态：边框转成墨色（浅色下就是"变黑"）、加粗到 1.5px，
+ * 外面再套一圈同色淡晕 —— 一眼看出焦点落在哪个框里。
+ *
+ * ⚠ 入口源文件 / 额外参数（.opt-row）和打包弹窗（.field-grid）**共用这一份**，
+ *   两处外观必须一样；`tools/test-theme.mjs` 会检查它们确实在同一个规则里，
+ *   别拆成两份各写一套。
+ *   `* { box-sizing: border-box }`，所以边框加粗不会把框撑大、不会引起布局跳动。
+ */
+.opt-row input:focus,
 .field-grid input:focus,
-.field-grid textarea:focus { outline: none; border-color: var(--accent); }
+.field-grid textarea:focus {
+  outline: none;
+  border-color: var(--text);
+  border-width: 1.5px;
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
 /* 聚焦时给个可见的输入光标，别让人以为点不进去 */
 .field-grid input { cursor: text; }
 .field-grid .hint { font-size: 11px; color: var(--text-faint); }

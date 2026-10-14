@@ -68,6 +68,20 @@ try {
   await vm.boot();
   console.log(`\n[vm] shell 就绪，用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
+  // v86 的鼠标 / 键盘适配器必须关掉：不传 screen_container 时它的「屏幕区域」回落到
+  // document.body，且 mousedown / wheel / contextmenu 都无条件 preventDefault ——
+  // guest 一启动就把宿主页面上这些默认行为全吃掉（输入框点不进去、选不中，滚轮失效）。
+  // 适配器对象在 Node 里同样会被创建（只是不挂 window 监听），所以这条断言真的有效。
+  const vmEmu = vm.emulator;
+  console.log(
+    `[vm] v86 适配器：mouse=${vmEmu.mouse_adapter ? '存在（❌ 会污染宿主页面）' : '不存在 ✓'}` +
+      ` keyboard=${vmEmu.keyboard_adapter ? '存在' : '不存在 ✓'}`
+  );
+  if (vmEmu.mouse_adapter || vmEmu.keyboard_adapter) {
+    console.error('[vm] ✗ 适配器没被关掉 → 见 tools/test-v86-mouse.mjs');
+    process.exitCode = 1;
+  }
+
   await vm.installToolchain(fs.readFileSync(rootfsPath), {
     onProgress: (p) => console.log(`[vm] 工具链进度 ${Math.round(p * 100)}%`),
   });

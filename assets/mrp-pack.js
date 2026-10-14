@@ -4,7 +4,8 @@
  * 格式依据（三份来源互相印证，并用两个真实样本逐字节校验过）：
  *   1. fengdeyingzi/MrpProjects → MrpEditor/src/mrpinfo.ts（在线编辑器）
  *   2. fengdeyingzi/mrpbuilder → mrp.go（gcc 路线实际使用的打包器）
- *   3. C:\APP\2048\build_output\game2048.mrp、C:\APP\ai\demo\WasteLand_240.mrp（真机可跑的产物）
+ *   3. 两份真机可跑的真实产物（自测样本，不随仓库分发；见 tools/test-pack.mjs 的
+ *      `MRP_SAMPLES` 环境变量 / `samples/*.mrp`）
  *
  * 文件结构：
  *   ┌──────────────── 240 字节固定头 ────────────────┐

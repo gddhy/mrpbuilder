@@ -188,6 +188,27 @@ export class MrpVm {
       memory_size: this.opts.memorySize || 384 * 1024 * 1024,
       filesystem: {},
       autostart: true,
+      /*
+       * 关掉 v86 的鼠标 / 键盘适配器 —— 本项目只用串口（界面里没有 guest 画面，
+       * 也从不往 guest 注入按键），但它俩的默认行为会**污染整个宿主页面**：
+       *
+       * · 鼠标适配器的「屏幕区域」= 构造参数 screen_container；本项目不传，于是它
+       *   回落到 document.body —— 页面上**任何一处**鼠标事件都被算成「落在屏幕里」。
+       *   它的监听挂在 window 上，mousedown / wheel / contextmenu 三个处理里都
+       *   无条件 preventDefault()。
+       * · 平时它是关的（`enabled` 由总线的 mouse-enable 消息打开）；guest 的 PS/2
+       *   鼠标驱动一启用数据上报（Linux 启动时就会发），v86 就把它打开 ——
+       *   正好对应「点『启动编译环境』之前输入框能点，之后就点不进去」。
+       * · 打开之后：mousedown 的默认行为（聚焦 + 落光标 + 起选区）被取消 → 源码
+       *   编辑区 / 入口源文件 / 额外参数这些输入框点不进去、选不中；wheel 被吃掉
+       *   → 页面滚轮失效（app.js 的 attachWheelScroll 还得跟它抢一遍）；右键菜单也没了。
+       *
+       * 键盘适配器虽然会跳过 INPUT / TEXTAREA 目标，但同样把 window 上的按键转给
+       * guest，没需求就一起关。将来真要显示 guest 画面时，改成传 screen_container
+       * 并去掉这两项即可（届时鼠标也随之恢复）。
+       */
+      disable_mouse: true,
+      disable_keyboard: true,
     });
     this.emulator = em;
     this._attach();

@@ -238,6 +238,36 @@ const undefinedVars = [...used].filter((v) => !light.has(v));
 ok('用到的 CSS 变量都有定义', undefinedVars.length === 0, undefinedVars.join(', '));
 
 // ---------------------------------------------------------------------------
+// 输入框的聚焦态：两处必须共用同一条规则
+// ---------------------------------------------------------------------------
+
+// 「入口源文件 / 额外参数」（.opt-row）和打包弹窗（.field-grid）的输入框，选中后
+// 的外观要求**完全一致**（墨色边框 + 加粗 + 一圈淡晕）。这里钉住它们出现在**同一个
+// 规则块**里 —— 拆成两份各写一套，迟早会走偏成两种样子。
+console.log('\n===== 输入框聚焦态 =====');
+
+const rules = [...noComment.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => [m[1], m[2]]);
+const focusRule = rules.find(
+  ([sel]) => sel.includes('.opt-row input:focus') && sel.includes('.field-grid input:focus')
+);
+ok(
+  '入口源文件 / 额外参数与打包弹窗的输入框共用同一条聚焦规则',
+  !!focusRule,
+  focusRule ? '' : '没有一条规则同时包含 .opt-row input:focus 与 .field-grid input:focus'
+);
+if (focusRule) {
+  const body = focusRule[1].replace(/\s+/g, ' ').trim();
+  ok('聚焦时边框转成墨色（浅色下即"变黑"）', /border-color:\s*var\(--text\)/.test(body), body);
+  ok('聚焦时边框加粗', /border-width:\s*1\.5px/.test(body));
+  ok('聚焦时套一圈淡晕（颜色走变量，不写字面色）', /box-shadow:\s*0 0 0 2px var\(--focus-ring\)/.test(body));
+  ok('聚焦态不靠 outline（会和上面的框重叠、各浏览器还不一样）', /outline:\s*none/.test(body));
+}
+ok(
+  '打包弹窗的多行输入（textarea）也走同一套',
+  focusRule ? focusRule[0].includes('.field-grid textarea:focus') : false
+);
+
+// ---------------------------------------------------------------------------
 // 三处内联脚本 / 按钮位置（防规则漂移）
 // ---------------------------------------------------------------------------
 

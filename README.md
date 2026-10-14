@@ -311,6 +311,7 @@ tools/
   test-theme.mjs            验证主题判定规则 + 两套调色板一致（含"没有字面颜色"守卫）
   test-imagecache.mjs       验证工具链镜像的本地缓存判定 + 无 indexedDB 时优雅退化
   test-ingest.mjs           验证导入路径规则 + .gitignore 解析与匹配（正反两面）
+  test-v86-mouse.mjs        验证 v86 的鼠标/键盘适配器被关掉（否则启动后输入框点不进去）
   dev-inspect-mrp.py        独立的 mrp 解析器（另一个实现，用来交叉验证）
 ```
 
@@ -426,6 +427,7 @@ node tools/test-errors.mjs      # 报错行提取
 node tools/test-theme.mjs       # 主题：判定规则 + 两套调色板一致性 + 内联脚本不漂移
 node tools/test-imagecache.mjs   # 镜像本地缓存：判定规则 + 存储不可用时优雅退化
 node tools/test-ingest.mjs      # 导入路径规则：剥顶层目录 + 隐藏项 + .gitignore 匹配
+node tools/test-v86-mouse.mjs   # v86 适配器：不关掉的话，启动虚拟机后输入框会点不进去
 python tools/check-elf.py .build/bin.elf   # 产物重定位校验
 ```
 
@@ -563,7 +565,7 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 
 依据三份来源互相印证：`MrpProjects/MrpEditor` 的 `mrpinfo.ts`、
 `mrpbuilder` 的 Go 版 `mrp.go`，以及两个真机可跑的样本
-（`game2048.mrp`、`WasteLand_240.mrp`）。
+（样本不随仓库分发，见 `tools/test-pack.mjs`）。
 
 ### 四个容易踩错的点
 
@@ -677,7 +679,7 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 
 | 校验 | 结果 |
 |---|---|
-| **两个真实样本逐字节往返**：把 `game2048.mrp` / `WasteLand_240.mrp` 里已 gzip 的数据原样取出，用自己的容器逻辑重新组装 | ✅ 两个都**一个字节都不差** |
+| **两个真实样本逐字节往返**：把两份真机可跑的 `.mrp` 里已 gzip 的数据原样取出，用自己的容器逻辑重新组装 | ✅ 两个都**一个字节都不差** |
 | CRC 变体判定 | ✅ 置零版吻合、`mrpinfo.ts` 的跳过版不吻合 |
 | **独立解析器交叉验证**：`tools/dev-inspect-mrp.py`（另一套实现）解析自己生成的产物 | ✅ 头 / 列表区 / 偏移 / CRC 全部自洽 |
 | **内容往返**：解开 `.mrp` 里的每个文件与源文件比对 | ✅ 5 个文件全部逐字节一致 |
@@ -686,7 +688,7 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 顺带确认了一件好事：Chrome 的 `CompressionStream` 与 Node 的 zlib
 对同一输入的 gzip 输出是字节一致的，所以两条路径可互换。
 
-### 顺手修掉的六个 bug
+### 顺手修掉的七个 bug
 
 **1. 虚拟机命令没有串行化。** 串口交互 shell 只有一条，而 `run()` 靠在 shell 里
 `echo` 哨兵来判断命令结束。打包对话框打开时会预读壳文件，如果用户此刻点「生成」，
@@ -730,13 +732,43 @@ part00 的"期望大小"于是等于**整个文件的大小**，浏览器下载 
 教训：**清单里每个字段的语义要在生成端和消费端各验证一遍**，
 第一版只在浏览器里"能拼出来"是不够的。
 
-**6. 打包弹窗的输入框点不进（原生 `<dialog>` 的兼容性问题）。**
-普通 Chromium 里一切正常，但用户的嵌入预览环境里 `<dialog>` 的顶层渲染
-让表单元素收不到鼠标事件。最终放弃 `<dialog>`，改成**普通覆盖层**
-（`position: fixed` + `z-index` + `.show` class 切换，Escape / 点遮罩关闭自行实现），
-行为在所有环境一致。
+**6. 打包弹窗的输入框点不进（当时以为是原生 `<dialog>` 的兼容性问题）。**
+普通 Chromium 里一切正常，但用户的嵌入预览环境里 `<dialog>` 的输入框点不进、打不了字。
+于是放弃 `<dialog>`，改成**普通覆盖层**（`position: fixed` + `z-index` + `.show` class 切换，
+Escape / 点遮罩关闭自行实现），又补了一段 `mousedown → focus()` 的兜底和一个焦点自检提示条。
+
+> **归因更正**：后来（见第 7 条）查明根因是 **v86 的鼠标适配器**在整页无条件
+> `preventDefault()` 掉 `mousedown`（默认行为里就包含"聚焦 + 落光标"）。
+> 打包按钮本来就要先编译出产物才可点，所以这个弹窗**必然**是在"适配器已生效"的状态下
+> 被使用的 —— 症状完全吻合，"`<dialog>` 顶层渲染"那条只是当时的猜测。
+> 改成普通覆盖层本身仍是好事（各环境行为一致、显隐可控），那段 `mousedown → focus()`
+> 兜底于是降级成了可选的保险（零副作用，删掉也不影响普通浏览器），
+> 详见 `assets/app.js` 里那段注释。
+
 （另一个坑：入口源文件的自动判断差点把 `src/encode.c` **注释块**里的
 `int main(` 例子当成真入口 —— 判断前先把 C 注释剥掉。）
+
+**7. 启动虚拟机之后，页面上的输入框点不进去。** 点「启动编译环境」之前
+源码编辑区 / 入口源文件 / 额外参数都能正常选中、正常输入；启动之后
+这三个框点不进、选不中（但按钮还能点）。
+
+根因在 v86 的**鼠标适配器**：它的「屏幕区域」取自构造参数 `screen_container`，
+而本项目界面上没有 guest 画面、没传这个参数，于是它**回落到 `document.body`** ——
+页面上任何一处鼠标事件都被判定成「落在屏幕里」。它的监听挂在 `window` 上，
+`mousedown` / `wheel` / `contextmenu` 三个处理里都无条件 `preventDefault()`。
+平时它是关的（`enabled` 由总线的 `mouse-enable` 消息打开），而 guest 的
+PS/2 鼠标驱动一启用数据上报（Linux 启动时就会发），v86 就把它打开 ——
+时间点正好是「点了启动编译环境之后」。之后 `mousedown` 的默认行为
+（聚焦 + 落光标 + 起选区）被取消，输入框自然点不进去；而 `click` 是独立事件，
+所以按钮照常能用 —— 这也解释了症状为什么只出现在文本输入上。
+
+修法：创建 `V86` 时显式传 `disable_mouse: true` + `disable_keyboard: true`
+（本项目只用串口，既没有 guest 画面也从不往 guest 注入按键）。
+顺带把上面那个「滚轮没反应」也一并解决了 —— 那个 `wheel` 处理器本来就会
+`preventDefault` 掉页面的滚轮。
+回归测试见 `tools/test-v86-mouse.mjs`（静态守卫 + 在 Node 里真的各造一个 V86
+对比适配器有没有被创建），`tools/test-v86.mjs` 启动后也会断言一次。
+将来若要显示 guest 画面，改成传 `screen_container` 并去掉这两项即可。
 
 ### 工程缺口的解决方式：`src/mrp_compat.c`
 

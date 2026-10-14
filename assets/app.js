@@ -1336,46 +1336,113 @@ attachOverlayDismiss(el.packOverlay, closePackOverlay);
 attachOverlayDismiss(el.helpOverlay, closeHelpOverlay);
 
 /**
- * 滚轮兜底：正常浏览器里 .dlg-body（overflow:auto）天生响应鼠标滚轮，
- * 但部分宿主环境（预览 iframe 等）会把 wheel 事件吃掉，表现为电脑端
- * 只能拖滚动条、滚轮无反应（手机端触摸不受影响）。这里手动接管：
- * 指针在弹窗上时把 deltaY 落到 .dlg-body 的 scrollTop 上。
- * 内部还有自己可滚的区域（如「介绍」textarea）且没滚到头时先放行给它。
+ * 鼠标滚轮兜底（工程文件 / 源码编辑 / 编译输出 + 弹窗）
+ *
+ * 正常浏览器里 overflow:auto 的元素天生响应鼠标滚轮；但部分宿主环境（嵌入式
+ * 预览 iframe 等）会把 wheel 事件整体吃掉 —— 表现为「触摸能滑、电脑上滚轮
+ * 完全没反应」。这里在 document 上统一接管：
+ *   从事件目标往上找**第一个朝这个方向还能滚**的元素，手动把 deltaY/deltaX
+ *   落到它的 scrollTop/scrollLeft 上；滚到头就继续往外层找（和原生链式滚动
+ *   一致）。确实滚动了才 preventDefault —— 不拦的话宿主把事件转给原生滚动时
+ *   会两边各滚一次、速度翻倍。
+ *
+ * 覆盖范围靠「就近可滚祖先」自动判定，所以不需要逐个登记：.filebar（文件
+ * 列表）、#editor（源码编辑，wrap=off 还要吃横向 deltaX）、#console（编译
+ * 输出）、窄屏下整栏滚动的 .pane，以及弹窗里的 .dlg-body 都走这一份逻辑。
+ * 弹窗另有一条约束：指针在弹窗里时只允许在弹窗内部滚（滚到头就停），
+ * 否则会漏到弹窗背后的页面上。
  */
-function attachOverlayWheel(overlay) {
-  overlay.addEventListener('wheel', (e) => {
-    if (!e.deltaY) return;
-    const dlg = e.target instanceof Element && e.target.closest('.dlg');
-    if (!dlg) return; // 指针在遮罩上，不接管
-    const body = dlg.querySelector('.dlg-body');
-    if (!body) return;
-    // 逐层向上找事件目标与 .dlg-body 之间有没有「自己还能滚」的元素
-    let node = e.target;
-    while (node instanceof Element && node !== body) {
-      if (node.scrollHeight > node.clientHeight + 1) {
-        const oy = getComputedStyle(node).overflowY;
-        if (oy === 'auto' || oy === 'scroll') {
-          const atTop = node.scrollTop <= 0;
-          const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 1;
-          if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+const WHEEL_LINE_PX = 40; // 行模式滚轮（Firefox 等 deltaMode=1）：1 行折合多少像素
+
+/** 该元素在指定方向上还能继续滚吗？必须看计算样式的 overflow，不能只看尺寸 */
+function canScroll(node, axis, delta) {
+  const scroll = axis === 'y' ? node.scrollHeight : node.scrollWidth;
+  const client = axis === 'y' ? node.clientHeight : node.clientWidth;
+  if (scroll <= client + 1) return false;
+  const style = getComputedStyle(node);
+  const overflow = axis === 'y' ? style.overflowY : style.overflowX;
+  if (overflow !== 'auto' && overflow !== 'scroll') return false;
+  const pos = axis === 'y' ? node.scrollTop : node.scrollLeft;
+  return delta < 0 ? pos > 0 : pos + client < scroll - 1;
+}
+
+function attachWheelScroll() {
+  document.addEventListener(
+    'wheel',
+    (e) => {
+      // Ctrl/Cmd + 滚轮 = 浏览器缩放，别抢
+      if (e.ctrlKey || e.metaKey) return;
+      if (!e.deltaY && !e.deltaX) return;
+      const toPx = (v) => (e.deltaMode === 1 ? v * WHEEL_LINE_PX : v);
+      const dy = toPx(e.deltaY);
+      const dx = toPx(e.deltaX);
+      const start = e.target instanceof Element ? e.target : null;
+      if (!start) return;
+      // 指针落在弹窗里 → 滚动只允许发生在弹窗内部
+      const scope = start.closest('.overlay');
+
+      let handled = false;
+      for (let node = start; node; node = node.parentElement) {
+        let moved = false;
+        if (dy && canScroll(node, 'y', dy)) {
+          node.scrollTop += dy;
+          moved = true;
+        }
+        if (dx && canScroll(node, 'x', dx)) {
+          node.scrollLeft += dx;
+          moved = true;
+        }
+        if (moved) {
+          handled = true;
+          break;
+        }
+        if (node === scope) break; // 弹窗内滚到头就停，别漏到背后的页面
+      }
+
+      // 弹窗里没找到可滚元素时（指针落在底部按钮条上等）→ 退回到弹窗正文，
+      // 这是原来那版的行为：指针在弹窗内就该滚正文，别因为压在按钮上就失灵
+      if (!handled && scope) {
+        const body = start.closest('.dlg')?.querySelector('.dlg-body');
+        if (body) {
+          let moved = false;
+          if (dy && canScroll(body, 'y', dy)) {
+            body.scrollTop += dy;
+            moved = true;
+          }
+          if (dx && canScroll(body, 'x', dx)) {
+            body.scrollLeft += dx;
+            moved = true;
+          }
+          handled = moved;
         }
       }
-      node = node.parentElement;
-    }
-    // Firefox 的滚轮是行单位（deltaMode=1），换算成像素
-    const step = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-    const before = body.scrollTop;
-    body.scrollTop = before + step;
-    if (body.scrollTop !== before) e.preventDefault(); // 确实滚动了才拦默认行为
-  }, { passive: false });
+
+      // 谁都没接（例如指针在页面空白上）→ 页面本身还能滚就交给它
+      if (!handled && !scope) {
+        const doc = document.scrollingElement;
+        if (doc && dy && doc.scrollHeight > doc.clientHeight + 1) {
+          const before = doc.scrollTop;
+          doc.scrollTop = before + dy;
+          handled = doc.scrollTop !== before;
+        }
+      }
+
+      if (handled) e.preventDefault(); // 确实滚动了才拦默认行为
+    },
+    { passive: false }
+  );
 }
-attachOverlayWheel(el.packOverlay);
-attachOverlayWheel(el.helpOverlay);
+attachWheelScroll();
 
 /**
  * 环境自检：程序化 focus 后 activeElement 应该是输入框。
  * 不是 → 说明宿主环境（预览 iframe 等）在更底层拦截了焦点，
  * 在弹窗顶部明确提示，别让用户以为是自己点错了。
+ *
+ * 注意它探的是**程序化 focus**，走不到鼠标事件链 —— 所以"点输入框没反应"那类
+ * 症状它不是负责的（那个根因是 v86 的鼠标适配器，见下面 grab() 的说明）。
+ * 它只负责"这一层环境根本不给输入框焦点"这种情况。留着的成本极低，
+ * 正常情况下永远静默，所以不删。
  */
 function checkOverlayInputEnv() {
   const probe = document.getElementById('pkDisplay');
@@ -1387,8 +1454,21 @@ function checkOverlayInputEnv() {
   hint.style.display = ok ? 'none' : 'block';
 }
 
-// 兜底：mousedown / touchstart 阶段就抢焦点（click 之前），部分宿主会吃掉
-// mousedown 的默认行为导致 focus 不发生，这里手动补上。
+/*
+ * 兜底：mousedown / touchstart 阶段就抢焦点（click 之前）。
+ *
+ * 起因是「打包弹窗里的输入框点不进、打不了字」。当时归因成 `<dialog>` 顶层渲染 /
+ * 宿主吞事件，最后用这段兜底 + 把弹窗改成普通覆盖层绕过去了。**真正的原因后来才
+ * 查出来**：v86 的鼠标适配器没传 screen_container，容器回落到 document.body，
+ * 于是整页的 mousedown 都被它无条件 preventDefault()（默认行为里就包含"聚焦 +
+ * 落光标"）—— guest 一启动就打开，而打包按钮本来就要先编译出产物才可点，所以这个
+ * 弹窗**必然**在"适配器已生效"的状态下使用。根因已在 `assets/vm.js` 里修掉
+ * （disable_mouse / disable_keyboard），这段兜底因此不再是必需的。
+ *
+ * 仍然保留：它零副作用（`focus()` 只会在点击本来就没能聚焦时补救；能正常聚焦时是
+ * no-op，默认行为照旧把光标放到点击位置），而宿主环境五花八门、这里没法逐个验证。
+ * 哪天确认所有宿主都不吞 mousedown 的默认行为，删掉这段也不会有任何影响。
+ */
 el.packOverlay.querySelectorAll('input, textarea').forEach((inp) => {
   const grab = () => { try { inp.focus(); } catch {} };
   inp.addEventListener('mousedown', grab);
