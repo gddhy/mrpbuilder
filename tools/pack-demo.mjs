@@ -12,7 +12,7 @@
  *   --version   默认 1
  *   --vendor    开发者（GBK ≤40）
  *   --desc      介绍（GBK ≤64）
- *   --auth      授权串，默认 ea50027c8（取自本机现有可运行的 mrp）
+ *   --auth      授权串，默认 ea50027c8（两份真机可跑的真实产物上的默认值）
  *   --flag      默认 7（可见 + CPU 3 + start 启动）
  *   --sw --sh   屏幕宽高，默认 0 0（与真实样本一致）
  *   --elf       bin.elf 路径，默认 .build/bin.elf

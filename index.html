@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MRP 纯前端编译环境 · v86 + arm-none-eabi-gcc</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="assets/style.css?v=20261014b">
+<link rel="stylesheet" href="assets/style.css?v=20261015d">
 <script>
   /*
    * 主题：在首次渲染之前把生效值打到 <html data-theme>，否则会先白一下再变深色。
@@ -72,10 +72,27 @@
       <ul id="fileList" class="filelist"></ul>
     </div>
 
-    <div class="editor-wrap">
-      <textarea id="editor" spellcheck="false" wrap="off"
-        placeholder="在此直接编辑源码，或从左边选择文件"></textarea>
-      <div class="editor-hint" id="editorHint">未选择文件</div>
+    <!-- 编辑器：行号槽 + [着色层 <pre> + 只负责输入的 textarea]。
+         两层排版必须完全一致（同一套字体 / 行高 / padding），滚动量由 JS 逐像素镜像；
+         「为什么不让着色层盖在上面」等细节见 assets/app.js 与 style.css 的注释。 -->
+    <div class="editor-wrap" id="editorWrap">
+      <div class="editor-main">
+        <div class="editor-gutter"><pre id="editorLines" aria-hidden="true"></pre></div>
+        <div class="editor-code">
+          <pre class="editor-hl" id="editorHl" aria-hidden="true"></pre>
+          <textarea id="editor" spellcheck="false" wrap="off"
+            placeholder="在此直接编辑源码，或从左边选择文件"></textarea>
+        </div>
+      </div>
+      <!-- 底部那行：左边是当前文件 / 状态，右边是「全屏」。
+           全屏只是给 .editor-wrap 挂一个 .maxed（position:fixed + inset:0，见 style.css），
+           不走 Fullscreen API —— 那会把浏览器 UI 一起切走，嵌入式预览宿主里还常被禁用；
+           这里要的只是「在网页内铺满」。 -->
+      <div class="editor-hint">
+        <span id="editorHint">未选择文件</span>
+        <button id="btnEditorMax" class="btn small" type="button" aria-pressed="false"
+          title="在网页内铺满显示，方便读 / 改代码；再点一次或按 Esc 退出">全屏</button>
+      </div>
     </div>
 
     <div id="drop" class="drop">
@@ -158,7 +175,7 @@
       <div class="field-grid">
         <label>授权串 authStr
           <input id="pkAuth" type="text" value="ea50027c8">
-          <span class="hint">取自你现有可运行 mrp 的值，一般不用改</span>
+          <span class="hint">真实可运行 mrp 里的参考值，一般不用改</span>
         </label>
         <label>flag
           <input id="pkFlag" type="number" value="7" min="0" step="1">
@@ -258,6 +275,6 @@
   </div>
 </div>
 
-<script type="module" src="assets/app.js?v=20261014i"></script>
+<script type="module" src="assets/app.js?v=20261015h"></script>
 </body>
 </html>

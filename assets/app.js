@@ -10,6 +10,16 @@ import { MrpVm } from './vm.js';
 import { unzip, zipDeflate } from './zip.js';
 import { cacheEntryMatches, readImageCache, writeImageCache } from './imagecache.js';
 import { fmtBytes, fmtDuration } from './bytes.js'; // 体积/耗时文案，与命令行共用同一份
+import { isSafeRelPath } from './serial.js'; // 相对路径白名单（重命名 / 删除前挡一道）
+import { wheelDeltas, planWheel } from './wheel.js'; // 滚轮决策（纯函数，单测覆盖）
+import { detectEncoding, decodeSource, encodeSource, ENC_UTF8, ENC_GBK } from './encoding.js'; // 源码编码识别（UTF-8 / GBK）
+import {
+  highlightC,
+  countLines,
+  lineNumbersText,
+  scrollMirror,
+  MAX_HIGHLIGHT_CHARS,
+} from './codeview.js'; // C 源码着色 + 行号（纯函数，单测覆盖）
 import {
   isJunkEntry,
   relativeNames,
@@ -78,7 +88,11 @@ const el = {
   dirInput: $('dirInput'),
   fileList: $('fileList'),
   editor: $('editor'),
+  editorWrap: $('editorWrap'),
+  editorHl: $('editorHl'),
+  editorLines: $('editorLines'),
   editorHint: $('editorHint'),
+  btnEditorMax: $('btnEditorMax'),
   drop: $('drop'),
   console: $('console'),
   optApp: $('optApp'),
@@ -89,12 +103,31 @@ const state = {
   vm: null,
   phase: 'off',        // off | boot | ready | err
   template: [],        // 镜像内置模板里的相对路径
+  /**
+   * 相对路径 -> 字节数（来自虚拟机的 `du -b` 列目录）。
+   * 只作显示用；**改过 / 传过的文件以 overrides 里那份字节为准**（那才是编译时写进去的），
+   * 见 fileSizeOf()。
+   */
+  sizes: new Map(),
+  /**
+   * 启动虚拟机时那份「没动过的」文件清单（排序后的名字）。
+   *
+   * 用来回答「工程还是内置模板吗」：重命名 / 删除 / 新增都不留内容痕迹（overrides 里
+   * 看不出来），所以拿现在的文件集跟这份比一比 —— 比记住一个「改过了」的布尔值可靠，
+   * 改回去（比如 A→B 又改回 A）也能自己变回"没动过"。
+   */
+  pristineNames: [],
   // 模板自带的 Makefile 字节：启动时从虚拟机读一份（镜像里那份），另加站点上那份。
   // 用途：判断「导进来的 Makefile 是不是模板自带的」——见 isTemplateMakefile。
   templateMakefiles: [],
   overrides: new Map(),// 相对路径 -> Uint8Array（用户上传/编辑过的）
   fromGuest: new Set(),// overrides 里那些「从模板原样读进来、没改过」的（编译时不重推）
   uploaded: new Set(), // 真正由用户上传/拖入的文件（用于挑「资源」）
+  /**
+   * 每个文件的编码：'utf-8' | 'gbk'。打开文件时识别（assets/encoding.js 的 detectEncoding），
+   * 保存时按它**原样编回** —— 中文字符串字面量的字节不能变，否则编译进真机乱码。
+   */
+  fileEncoding: new Map(),
   shell: new Map(),    // 壳文件字节缓存（lib/start.mr、lib/cfunction.ext）
   packRes: new Set(),  // 打包时勾选的资源
   packResTouched: false,
@@ -152,6 +185,22 @@ function fmtTiming(t) {
 function writeLine(text) {
   state.logBuf.push(text + '\n');
   if (!flushTimer) flushTimer = setTimeout(flush, 80);
+}
+
+/**
+ * 「文件状态」日志行：统一 `[文件]` 前缀，一眼能和编译输出区分开。
+ *
+ * **只在状态真的变了才写一次**（键 = 文件名 + 类别）：编辑器里每敲一下都会走
+ * saveEditor，每次都写就把日志刷爆了。所以「已修改」那条**不带字节数** ——
+ * 带了每次敲键文本都不一样，去重就失效了。
+ * 恢复模板 / 重启虚拟机时整体清空（见 clearClientProject）。
+ */
+const fileLog = new Map();
+function logFile(name, kind, text) {
+  const key = `${name}\n${kind}`;
+  if (fileLog.get(key) === text) return;
+  fileLog.set(key, text);
+  writeLine(`[文件] ${text}`);
 }
 
 function flush() {
@@ -281,20 +330,30 @@ function setBusy(on) {
 function isTemplatePristine() {
   if (state.uploaded.size) return false;
   for (const n of state.overrides.keys()) if (!state.fromGuest.has(n)) return false;
+  // 文件集也一样（重命名 / 删除 / 新增都不留内容痕迹）
+  const now = allFiles();
+  if (now.length !== state.pristineNames.length) return false;
+  for (let i = 0; i < now.length; i++) if (now[i] !== state.pristineNames[i]) return false;
   return true;
 }
 
-/** 「下载demo」的可用状态与提示文案 */
+/**
+ * 「下载demo / 下载当前项目」按钮的文案与可用状态。
+ *
+ * 只有编译环境就绪后能点（打包要去虚拟机里逐个取文件）；就绪之后**一直可点** ——
+ * 改过了也一样能下载，只是下的是"当前工程"，文案跟着变，不让人误以为拿到的是原始模板。
+ */
 function refreshDemoButton() {
   if (!el.btnDemo) return;
+  const ready = state.phase === 'ready';
   const pristine = isTemplatePristine();
-  el.btnDemo.disabled = state.busy || state.phase !== 'ready' || !pristine;
-  el.btnDemo.title =
-    state.phase !== 'ready'
-      ? '先点「启动编译环境」——demo 工程包是现从虚拟机里的模板取的'
-      : pristine
-        ? '把内置示例工程的源码打包成 zip 下载（内容取自虚拟机里的模板，可改完再拖回来）'
-        : '已改动过工程，不能再下载 demo（避免下到的不是内置模板）；点「恢复模板」可恢复';
+  el.btnDemo.disabled = state.busy || !ready;
+  el.btnDemo.textContent = pristine ? '下载demo' : '下载当前项目';
+  el.btnDemo.title = !ready
+    ? '先点「启动编译环境」——工程包是现从虚拟机里取文件打包的'
+    : pristine
+      ? '把内置示例工程打包成 zip 下载（未改动过，取的就是模板那份；改完再拖回来即可）'
+      : '把**当前**工程（含你的改动）打包成 zip 下载 —— 已经不是原始模板了';
 }
 
 // ---------------------------------------------------------------------------
@@ -307,23 +366,385 @@ function allFiles() {
   return [...names].sort();
 }
 
+/**
+ * 重新问虚拟机要一份工程清单（名字 + 字节大小）。
+ *
+ * 重命名 / 删除 / 恢复模板之后都要来一次 —— 虚拟机里那份才是唯一真相，
+ * 前端别自己猜"现在工程里有什么"。
+ */
+async function refreshProjectIndex() {
+  if (!state.vm) return;
+  const list = await state.vm.listProjectFiles();
+  state.sizes = new Map(list.map((f) => [f.name, f.size]));
+  // 引擎预编译归档不当"用户文件"看：二进制、体积大、不需要进编辑器
+  state.template = list.map((f) => f.name).filter((n) => !ENGINE_FILES.includes(n));
+}
+
+/**
+ * 一个文件现在多大？
+ * 改过 / 传过的以内存里那份字节为准 —— 那才是编译时写进虚拟机的长度；
+ * 其余用虚拟机列出来的实际大小。拿不到就返回 null（界面上显示 —）。
+ */
+function fileSizeOf(name) {
+  const bytes = state.overrides.get(name);
+  if (bytes) return bytes.length;
+  return state.sizes.get(name) ?? null;
+}
+
+/** 一行：文件名 + 大小 + 状态 + 两个操作按钮（重命名 / 删除） */
+function fileRow(name) {
+  const li = document.createElement('li');
+  li.dataset.name = name;
+  li.setAttribute('aria-selected', String(name === state.selected));
+
+  const label = document.createElement('span');
+  label.className = 'fname';
+  label.textContent = name;
+  label.title = name; // 名字被省略号截断时，悬停能看全
+
+  const meta = document.createElement('span');
+  meta.className = 'fmeta';
+
+  const bytes = fileSizeOf(name);
+  const size = document.createElement('span');
+  size.className = 'fsize';
+  size.textContent = bytes == null ? '—' : fmtBytes(bytes);
+  size.title = bytes == null ? '大小未知（重启编译环境可以刷新）' : `${bytes} 字节`;
+
+  const editTag = document.createElement('span');
+  // 「已修改」= 真动过内容。只是从模板读进编辑器看一眼的（fromGuest）字节与模板相同，
+  // 标成"已修改"会误导 —— 顺便和 isTemplatePristine 的判定保持一致。
+  const changed = state.overrides.has(name) && !state.fromGuest.has(name);
+  editTag.className = 'tag' + (changed ? ' new' : '');
+  editTag.textContent = changed ? '已修改' : '模板';
+
+  meta.append(
+    size,
+    editTag,
+    iconButton('重命名', ICON.rename, () => startRename(name)),
+    iconButton('删除', ICON.trash, () => armDelete(name, li, editTag), 'del')
+  );
+  li.append(label, meta);
+  li.onclick = () => selectFile(name);
+  return li;
+}
+
 function renderFiles() {
   el.fileList.innerHTML = '';
   refreshDemoButton(); // 文件列表变了基本就意味着「改过/恢复过」，按钮状态跟着走
-  for (const name of allFiles()) {
-    const li = document.createElement('li');
-    li.setAttribute('aria-selected', String(name === state.selected));
-    const label = document.createElement('span');
-    label.textContent = name;
-    const tag = document.createElement('span');
-    const edited = state.overrides.has(name);
-    tag.className = 'tag' + (edited ? ' new' : '');
-    tag.textContent = edited ? '已修改' : '模板';
-    li.append(label, tag);
-    li.onclick = () => selectFile(name);
-    el.fileList.append(li);
+  for (const name of allFiles()) el.fileList.append(fileRow(name));
+}
+
+/** 小图标按钮（文件行里那两颗）。图标是写死的常量，没有用户输入参与 innerHTML。 */
+function iconButton(title, svg, onClick, extraClass = '') {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = extraClass ? `fbtn ${extraClass}` : 'fbtn';
+  b.title = title;
+  b.setAttribute('aria-label', title);
+  b.innerHTML = svg;
+  b.onclick = (e) => {
+    e.stopPropagation(); // 别顺带把文件选中了
+    onClick();
+  };
+  return b;
+}
+
+/* 文件行里用的两个图标（12px、跟着主题色走） */
+const ICON = {
+  rename:
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+  trash:
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/></svg>',
+  check:
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+  cross:
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+};
+
+/* ---------- 重命名 / 删除：改的是虚拟机里那份（前端不另存副本） ---------- */
+
+const renameTarget = (from, base) =>
+  (from.includes('/') ? from.slice(0, from.lastIndexOf('/') + 1) : '') + base;
+
+/**
+ * 把某一行变成输入框（就地改名），确定 / 取消 / Enter / Esc。
+ * 只改**名字**部分：目录保持不变 —— 免得手滑把文件搬到别处或搬出工程之外。
+ */
+function startRename(name) {
+  const li = [...el.fileList.children].find((x) => x.dataset.name === name);
+  if (!li) return;
+  const base = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'frename';
+  input.value = base;
+  input.spellcheck = false;
+  input.setAttribute('aria-label', `重命名 ${base}`);
+  input.onclick = (e) => e.stopPropagation(); // 点输入框别把文件选中了
+
+  let settled = false;
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    renderFiles();
+  };
+  const confirm = () => {
+    if (settled) return;
+    settled = true;
+    commitRename(name, input.value.trim());
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      confirm();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancel();
+    }
+  };
+
+  const meta = document.createElement('span');
+  meta.className = 'fmeta';
+  meta.append(iconButton('确定改名', ICON.check, confirm), iconButton('取消', ICON.cross, cancel));
+  li.replaceChildren(input, meta);
+  // 光标停在扩展名之前（选中主文件名），改名多半是先打名字再保留后缀
+  input.focus();
+  const dot = base.lastIndexOf('.');
+  input.setSelectionRange(0, dot > 0 ? dot : base.length);
+}
+
+/** 改名前的检查：都在前端做完，别把明显不行的名字发到虚拟机里试 */
+function renameNameError(from, to) {
+  if (to === from) return null;
+  if (!to) return '文件名不能是空的';
+  if (to.includes('/')) return '只能改名字本身，不能带 /（要挪位置请用「选择文件」重新导入）';
+  if (!isSafeRelPath(to)) return '这个名字在虚拟机里不安全（控制字符 / 路径跳转之类）';
+  if (allFiles().includes(to)) return `${to} 已经存在了`;
+  return null;
+}
+
+async function commitRename(from, base) {
+  const to = renameTarget(from, base);
+  const bad = renameNameError(from, to);
+  if (bad) {
+    writeLine(`\n✗ 没改成：${bad}`);
+    renderFiles();
+    return;
+  }
+  if (to === from) {
+    renderFiles(); // 名字没变，当取消
+    return;
+  }
+  if (state.busy || state.phase !== 'ready') {
+    writeLine('\n✗ 先启动编译环境才能改名（改的是虚拟机里的工程目录）');
+    renderFiles();
+    return;
+  }
+
+  setBusy(true);
+  try {
+    await state.vm.renameProjectFile(from, to);
+    // 前端那几份"哪些文件读过/改过"的记录跟着搬（内容本身在虚拟机里，不用动）
+    const bytes = state.overrides.get(from);
+    if (bytes) {
+      state.overrides.delete(from);
+      state.overrides.set(to, bytes);
+    }
+    if (state.fromGuest.delete(from)) state.fromGuest.add(to);
+    if (state.uploaded.delete(from)) state.uploaded.add(to);
+    if (state.packRes.delete(from)) state.packRes.add(to);
+    const size = state.sizes.get(from);
+    state.sizes.delete(from);
+    if (size != null) state.sizes.set(to, size);
+    const enc = state.fileEncoding.get(from);
+    state.fileEncoding.delete(from);
+    if (enc) state.fileEncoding.set(to, enc);
+    if (state.selected === from) {
+      state.selected = to;
+      if (state.editorBase?.name === from) state.editorBase = { ...state.editorBase, name: to };
+      el.editorHint.textContent = state.fromGuest.has(to)
+        ? `${to}（已从模板载入，未修改）`
+        : `${to}（已修改，编译时写入虚拟机）`;
+    }
+    if (el.optApp.value.trim() === from) {
+      el.optApp.value = to;
+      writeLine(`  入口源文件也跟着改成 ${to}`);
+    }
+    // 文件集变了 → isTemplatePristine() 自己会判成「改动过」，不用额外记标志
+    await refreshProjectIndex();
+    renderFiles();
+    writeLine(`\n✓ 已重命名：${from} → ${to}`);
+  } catch (e) {
+    writeLine(`\n✗ ${e.message}`);
+    renderFiles();
+  } finally {
+    setBusy(false);
   }
 }
+
+/**
+ * 删除的确认：第一次点变成「再点一次删除」（6 秒内有效，之后自动收回）。
+ * 不用 window.confirm —— 嵌入式宿主里的原生对话框不可靠，而且这个更省事。
+ * 窗口别太短：4 秒实测嫌紧（看一眼提示再点第二下，慢了就白点一次）。
+ */
+let deleteArmed = { name: null, timer: 0 };
+const DELETE_CONFIRM_MS = 6000;
+function armDelete(name, li, tagEl) {
+  if (deleteArmed.name === name) {
+    clearTimeout(deleteArmed.timer);
+    deleteArmed = { name: null, timer: 0 };
+    commitDelete(name);
+    return;
+  }
+  clearTimeout(deleteArmed.timer);
+  deleteArmed = {
+    name,
+    timer: setTimeout(() => {
+      deleteArmed = { name: null, timer: 0 };
+      renderFiles();
+    }, DELETE_CONFIRM_MS),
+  };
+  li.classList.add('confirm-del');
+  li.querySelector('.fbtn.del')?.classList.add('danger');
+  if (tagEl) {
+    tagEl.textContent = '再点一次删除';
+    tagEl.className = 'tag danger';
+  }
+}
+
+/** 入口源文件被删掉之后退回到哪个：优先 main.c，其次默认的 helloworld.c，再退第一个 .c */
+function fallbackEntry() {
+  const cs = allFiles().filter((n) => /\.c$/i.test(n));
+  return (
+    cs.find((n) => /(^|\/)main\.c$/i.test(n)) ||
+    (cs.includes('helloworld.c') ? 'helloworld.c' : cs[0]) ||
+    'helloworld.c'
+  );
+}
+
+async function commitDelete(name) {
+  if (state.busy || state.phase !== 'ready') {
+    writeLine('\n✗ 先启动编译环境才能删除（删的是虚拟机里的工程目录）');
+    return;
+  }
+  setBusy(true);
+  try {
+    await state.vm.deleteProjectFile(name);
+    state.overrides.delete(name);
+    state.fromGuest.delete(name);
+    state.uploaded.delete(name);
+    state.packRes.delete(name);
+    state.sizes.delete(name);
+    state.fileEncoding.delete(name);
+    if (state.selected === name) {
+      state.selected = null;
+      clearEditor();
+      el.editorHint.textContent = '未选择文件';
+    }
+    // 文件集变了 → isTemplatePristine() 自己会判成「改动过」
+    await refreshProjectIndex(); // 先刷新清单，再挑替代的入口（否则可能挑到刚删掉那个）
+    if (el.optApp.value.trim() === name) {
+      el.optApp.value = fallbackEntry();
+      writeLine(`  入口源文件已改回 ${el.optApp.value}（原来那个被删了）`);
+    }
+    renderFiles();
+    writeLine(`\n✓ 已从虚拟机里删除 ${name}`);
+  } catch (e) {
+    writeLine(`\n✗ ${e.message}`);
+    renderFiles();
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+/**
+ * 源码编辑器：行号 + 着色。
+ *
+ * 结构（见 index.html）：`行号槽 | [着色层 <pre> + textarea]`
+ *   · textarea 只管输入 —— 文字透明、光标可见，彩色文字由底下那层 <pre> 画；
+ *   · 两层共用同一套字体 / 字号 / 行高 / padding，滚动量逐像素镜像，
+ *     看上去就是一个带颜色的编辑器；
+ *   · 为什么不让着色层盖在上面？那样原生选区背景（textarea 画的）会被盖住，
+ *     鼠标拖选就看不见高亮了。
+ */
+let editorRenderTimer = 0;
+let editorScrollRaf = 0;
+
+/** 把 textarea 的滚动量镜像给行号槽（只竖向）与着色层（两个方向） */
+function syncEditorScroll() {
+  const t = scrollMirror(el.editor.scrollLeft, el.editor.scrollTop);
+  el.editorHl.style.transform = t.hl;
+  el.editorLines.style.transform = t.lines;
+}
+
+/** 滚动事件很密，用 rAF 合并，别每隔几十微秒就写一次 style */
+function onEditorScroll() {
+  if (editorScrollRaf) return;
+  editorScrollRaf = requestAnimationFrame(() => {
+    editorScrollRaf = 0;
+    syncEditorScroll();
+  });
+}
+
+/**
+ * 重绘行号与着色。输入时走防抖（一次 20~50ms，不能每个按键都做），
+ * 换文件 / 载入模板时立刻画。
+ */
+function renderEditor() {
+  const text = el.editor.value;
+  el.editorLines.textContent = lineNumbersText(countLines(text));
+  // 超长文件不着色（几百 KB 会生成几万个 span，输入就没法看了）。
+  // 这时必须把 textarea 的文字恢复成不透明，否则一个字都看不见 —— 见 .editor-wrap.no-hl
+  const plain = text.length > MAX_HIGHLIGHT_CHARS;
+  el.editorWrap.classList.toggle('no-hl', plain);
+  el.editorHl.innerHTML = plain ? '' : highlightC(text);
+  syncEditorScroll();
+}
+
+/** 清空编辑器（二进制资源 / 还没启动虚拟机时用） */
+function clearEditor() {
+  state.editorBase = null;
+  el.editor.value = '';
+  el.editor.scrollTop = 0;
+  el.editor.scrollLeft = 0;
+  renderEditor();
+}
+
+/**
+ * 网页内全屏：让编辑器铺满整个视口，专供读代码 / 改代码。
+ *
+ * 只切一个 class（`.maxed`，见 style.css）—— 布局不用动：编辑器本来就是
+ * 「flex 列 + 中间那层 flex:1」，`position:fixed; inset:0` 之后自然撑满。
+ * 不用 Fullscreen API：那会把浏览器 UI 一起切走，嵌入式预览宿主里还常被禁用，
+ * 而这里要的只是「在网页内铺满」。
+ *
+ * 退出方式：按钮再点一次，或按 Esc（与弹窗共用一处监听，弹窗优先 —— 见文件末尾）。
+ */
+function setEditorMaxed(on) {
+  el.editorWrap.classList.toggle('maxed', on);
+  document.body.classList.toggle('editor-maxed', on);
+  el.btnEditorMax.textContent = on ? '退出全屏' : '全屏';
+  el.btnEditorMax.setAttribute('aria-pressed', on ? 'true' : 'false');
+  // 尺寸变了，光标可能落在可视区外 —— 顺手把焦点还给编辑器，切完就能接着敲
+  try {
+    el.editor.focus({ preventScroll: true });
+  } catch {
+    el.editor.focus();
+  }
+}
+el.btnEditorMax.addEventListener('click', () => {
+  setEditorMaxed(!el.editorWrap.classList.contains('maxed'));
+});
 
 /**
  * 把文本放进编辑器，并把它记成「基准」。
@@ -333,6 +754,10 @@ function renderFiles() {
 function setEditorText(name, text) {
   el.editor.value = text;
   state.editorBase = { name, text: el.editor.value };
+  // 换文件要把视图挪回左上角，再重画（否则会带着上一个文件的滚动位置）
+  el.editor.scrollTop = 0;
+  el.editor.scrollLeft = 0;
+  renderEditor();
 }
 
 async function selectFile(name) {
@@ -341,40 +766,64 @@ async function selectFile(name) {
 
   // 二进制资源不走编辑器：按 UTF-8 拆一份再保存回去会把内容改坏
   if (isBinaryName(name)) {
-    state.editorBase = null;
-    el.editor.value = '';
+    clearEditor();
     const inPack = isResourceCandidate(name);
     el.editorHint.textContent =
       `${name} —— 二进制资源，不在编辑器里打开` +
       (inPack ? '（打包 .mrp 时会按原样带上）' : '');
+    logFile(name, 'open', `打开 ${name}：二进制资源，不在编辑器里显示${inPack ? '（打包 .mrp 时会按原样带上）' : ''}`);
     return;
   }
 
   if (state.overrides.has(name)) {
-    setEditorText(name, new TextDecoder().decode(state.overrides.get(name)));
-    el.editorHint.textContent = `${name}（已修改，编译时写入虚拟机）`;
+    const bytes = state.overrides.get(name);
+    // 编码识别一遍并记住（改完之后要按它编回去）
+    const enc = detectEncoding(bytes);
+    state.fileEncoding.set(name, enc);
+    setEditorText(name, decodeSource(bytes));
+    const encTag = enc === ENC_GBK ? '，GBK 编码' : '';
+    // 只是从模板读进来、没动过的（fromGuest）别写成"已修改" —— 与列表里的标签、
+    // 与 isTemplatePristine 的判定保持一致
+    el.editorHint.textContent = state.fromGuest.has(name)
+      ? `${name}（已从模板载入，未修改${encTag}）`
+      : `${name}（已修改，编译时写入虚拟机${encTag}）`;
+    logFile(
+      name,
+      'open',
+      state.fromGuest.has(name)
+        ? `打开 ${name}（${fmtBytes(bytes.length)}${encTag}，与虚拟机里那份一致，未修改）`
+        : `打开 ${name}（${fmtBytes(bytes.length)}${encTag}，内存里那份已改过，编译时写入虚拟机）`
+    );
     return;
   }
   if (state.phase !== 'ready') {
-    state.editorBase = null;
-    el.editor.value = '';
+    clearEditor();
     el.editorHint.textContent = `${name} —— 先启动编译环境才能读取模板内容`;
     return;
   }
   el.editorHint.textContent = `正在读取 ${name} …`;
   try {
     const bytes = await state.vm.readProjectFile(name);
+    const enc = detectEncoding(bytes);
+    state.fileEncoding.set(name, enc);
     state.overrides.set(name, bytes);
     // 记成「与虚拟机里那份字节相同」：编译时不必再推一遍 —— 只是点开看一眼就
     // 推回去，等于白白多一次 9p 写 + 一次 mkdir/cp 往返。
     // （引擎归档的一致性由 Makefile 的摘要校验兜着，所以这里只是省事，不是必须。）
     state.fromGuest.add(name);
-    setEditorText(name, new TextDecoder().decode(bytes));
-    el.editorHint.textContent = `${name}（已从模板载入）`;
+    setEditorText(name, decodeSource(bytes));
+    el.editorHint.textContent =
+      `${name}（已从模板载入，未修改${enc === ENC_GBK ? '，GBK 编码' : ''}）`;
+    logFile(
+      name,
+      'open',
+      `读取 ${name}（${fmtBytes(bytes.length)}${enc === ENC_GBK ? '，GBK 编码' : ''}，来自虚拟机里的工程）`
+    );
     renderFiles();
   } catch (e) {
     state.editorBase = null;
     el.editorHint.textContent = `读取失败：${e.message}`;
+    logFile(name, 'open', `读取 ${name} 失败：${e.message}`);
   }
 }
 
@@ -402,17 +851,24 @@ function saveEditor() {
     return;
   }
 
-  const next = new TextEncoder().encode(el.editor.value);
+  // 按文件**原来的编码**编回去（GBK 文件仍是 GBK），中文字符串字面量的字节才不会变
+  const enc = state.fileEncoding.get(name) ?? ENC_UTF8;
+  const next = encodeSource(el.editor.value, enc);
   const prev = state.overrides.get(name);
   // build() 开头也会调这里 —— 光选中文件、内容没动过时不能算「改过」，
   // 否则「点开看一眼再编译」就会把同一份源码多推一遍（还多一次往返）。
   const unchanged =
     prev && prev.length === next.length && prev.every((v, i) => v === next[i]);
   state.overrides.set(name, next);
-  if (!unchanged) state.fromGuest.delete(name);
+  if (!unchanged) {
+    state.fromGuest.delete(name);
+    // 日志里明说一声（只在**第一次**真正改动时写，见 logFile 的去重）：
+    // 否则用户只能从编辑器底下那行小字猜自己刚才那次操作到底改了什么
+    logFile(name, 'edit', `已修改 ${name} —— 编译时会写进虚拟机`);
+  }
   state.editorBase = { name, text: el.editor.value };
   renderFiles();
-  el.editorHint.textContent = `${name}（已修改，编译时写入虚拟机）`;
+  el.editorHint.textContent = `${name}（已修改，编译时写入虚拟机${enc === ENC_GBK ? '，GBK 编码' : ''}）`;
 }
 
 // ---------------------------------------------------------------------------
@@ -683,8 +1139,9 @@ async function boot() {
     writeLine('\n✓ 工具链已装入虚拟机');
 
     // 引擎预编译归档不当"用户文件"看：二进制、体积大、不需要进编辑器
-    state.template = (await vm.listProjectFiles()).filter((n) => !ENGINE_FILES.includes(n));
+    await refreshProjectIndex();
     state.overrides.clear();
+    state.pristineNames = [...state.template]; // 刚启动的虚拟机 = 干净的内置模板
     state.selected = null;
     state.editorBase = null;
     // 顺手记下模板自带的 Makefile（镜像里那份）：导入 demo 包时用来判断
@@ -735,8 +1192,20 @@ async function build() {
   try {
     // 只推真正变过的文件：从模板原样读进编辑器、没改过的那些，虚拟机里本来就是
     // 同一份字节，再推一遍纯属浪费（见 fromGuest 的说明）。
+    const changed = [...state.overrides.keys()].filter((n) => !state.fromGuest.has(n));
     const files = Object.fromEntries(
       [...state.overrides].filter(([n]) => !state.fromGuest.has(n))
+    );
+    /*
+     * 同步这件事要在日志里说清楚：源文件改过之后，用户最关心的就是
+     * 「我改的那份到底有没有进虚拟机」。列表带名字（最多 3 个），
+     * 前缀与编辑时的 [文件] 行一致，一眼能串起来。
+     */
+    writeLine(
+      changed.length
+        ? `[文件] 同步到虚拟机：${changed.length} 个改动` +
+            `（${changed.slice(0, 3).join('、')}${changed.length > 3 ? ' 等' : ''}）`
+        : '[文件] 源码没有改动，直接编译'
     );
     // 用户没自带 Makefile 时，注入站点上最新的模板 Makefile（镜像里可能是旧版）
     if (!files['Makefile']) {
@@ -831,36 +1300,44 @@ function downloadArtifact() {
 }
 
 /**
- * 「下载demo」：**从虚拟机里现取内置模板**，打包成 zip 下载。
+ * 「下载demo / 下载当前项目」：把工程打包成 zip 下载。
  *
- * 为什么不再放一个静态的 mrp_demo.zip：那个文件与镜像里的模板是两份东西，
- * 改了模板忘了重新生成 zip，就会发出去一个和实际模板对不上的工程包
- * （真发生过：zip 停在 9-16 那版，仓库的 src/ 已经是 9-17 的样子，
- *  test-zip 那项「内容与磁盘文件一致」一直红着）。现在内容只有一个来源 ——
- * 虚拟机里正在被编译的那份模板。
+ * 内容**只有一个来源 —— 虚拟机里的工程目录**（没改动过时它就等于内置模板）：
+ * 不再放静态的 mrp_demo.zip，否则改了模板忘了重新生成 zip，就会发出去一个和实际
+ * 模板对不上的工程包（真发生过：zip 停在 9-16 那版，仓库的 src/ 已经是 9-17 的样子，
+ * test-zip 那项「内容与磁盘文件一致」一直红着）。
  *
- * 只在「已启动 + 模板没被改动」时能点（见 refreshDemoButton）：改过之后
- * 取出来的就不是内置模板了，下下来只会误导人。
+ * 按 `isTemplatePristine()` 分两种口味（按钮文案见 refreshDemoButton）：
+ *   · 没动过 → 「下载demo」：取的就是内置模板那份（mrp_demo.zip）；
+ *   · 改过（编辑 / 导入 / 重命名 / 删除）→ 「下载当前项目」：连你的改动一起打包
+ *     （mrp_project.zip），文件名也换一个，别和原始 demo 混在一起。
+ * 下载出来的包再拖回来，就是同一份工程 —— 导入时会认模板自带的那几份 Makefile。
  */
-async function downloadDemo() {
-  if (state.busy || state.phase !== 'ready' || !isTemplatePristine()) return;
-  const names = [...state.template].sort();
+async function downloadProjectZip() {
+  if (state.busy || state.phase !== 'ready') return;
+  const pristine = isTemplatePristine();
+  const kind = pristine ? '内置 demo 模板' : '当前工程（含你的改动）';
+  const names = allFiles();
   if (!names.length) {
-    writeLine('\n（模板文件列表是空的 —— 先重新点一次「启动编译环境」）');
+    writeLine('\n（工程里一个文件都没有 —— 先重新点一次「启动编译环境」）');
     return;
   }
 
   setBusy(true);
-  writeLine(`\n===== 打包 demo 工程包（${names.length} 个文件，取自虚拟机里的模板）=====`);
+  writeLine(`\n===== 打包 ${kind}（${names.length} 个文件，取自虚拟机里的工程目录）=====`);
   try {
     const files = [];
     for (let i = 0; i < names.length; i++) {
       const n = names[i];
-      // 从模板读进编辑器、没动过的那些已在 overrides 里，字节与虚拟机里一致，
-      // 直接用可以省一次 9p 往返
-      const cached = state.fromGuest.has(n) ? state.overrides.get(n) : null;
+      /*
+       * 前端手里有字节就直接用：overrides 里那份就是「编译时会写进虚拟机的内容」——
+       * 改过的文件是编辑器里的文本，只是点开看过的那些是原样读回来的模板字节。
+       * 这也顺带解决一个坑：**刚导入、还没编译过的文件在虚拟机里根本不存在**，
+       * 去 readProjectFile 只会失败；它在 overrides 里有字节，直接打包就好。
+       */
+      const cached = state.overrides.get(n);
       files.push({ name: n, data: cached ?? (await state.vm.readProjectFile(n)) });
-      el.phase.textContent = `读取模板 ${i + 1}/${names.length}`;
+      el.phase.textContent = `读取 ${i + 1}/${names.length}`;
     }
 
     el.phase.textContent = '压缩中 …';
@@ -877,16 +1354,18 @@ async function downloadDemo() {
       );
     }
 
+    const zipName = pristine ? 'mrp_demo.zip' : 'mrp_project.zip';
     const blob = new Blob([zip], { type: 'application/zip' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'mrp_demo.zip';
+    a.download = zipName;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    writeLine(`✓ 已生成 mrp_demo.zip（${files.length} 个文件，${fmtBytes(zip.length)}），开始下载`);
+    writeLine(`✓ 已生成 ${zipName}（${files.length} 个文件，${fmtBytes(zip.length)}），开始下载`);
+    if (!pristine) writeLine('  改过工程 → 这是「当前项目」；想要原始 demo 先点「恢复模板」再下');
     writeLine('  自检：用项目自己的 zip 解析器读回，条目数与每项长度都对得上');
   } catch (e) {
-    writeLine(`\n✗ 打包 demo 失败：${e.message}`);
+    writeLine(`\n✗ 打包失败：${e.message}`);
   } finally {
     el.phase.textContent = '—';
     setBusy(false);
@@ -1272,7 +1751,7 @@ async function doPack() {
 el.btnBoot.onclick = boot;
 el.btnBuild.onclick = build;
 el.btnDownload.onclick = downloadArtifact;
-el.btnDemo.onclick = downloadDemo;
+el.btnDemo.onclick = downloadProjectZip;
 el.btnClear.onclick = clearConsole;
 el.btnPack.onclick = openPackDialog;
 el.btnPackCancel.onclick = closePackOverlay;
@@ -1351,8 +1830,15 @@ attachOverlayDismiss(el.helpOverlay, closeHelpOverlay);
  * 输出）、窄屏下整栏滚动的 .pane，以及弹窗里的 .dlg-body 都走这一份逻辑。
  * 弹窗另有一条约束：指针在弹窗里时只允许在弹窗内部滚（滚到头就停），
  * 否则会漏到弹窗背后的页面上。
+ *
+ * 两个修饰键：
+ *   · Ctrl/Cmd + 滚轮 → 直接放行（浏览器缩放）；
+ *   · Shift + 滚轮 → **只横向**（原生行为）。滚到最左/最右就停住，绝不退回纵向 ——
+ *     早期版本"到头退回纵向"会让画面忽然上下跳，比什么都不做更烦人。
+ *
+ * 「滚谁、滚多少」的决策在 `assets/wheel.js`（纯函数，单测 tools/test-wheel.mjs）；
+ * 这里只做 DOM 那半：收集祖先链、判定能不能滚、把结果落到 scrollTop/scrollLeft。
  */
-const WHEEL_LINE_PX = 40; // 行模式滚轮（Firefox 等 deltaMode=1）：1 行折合多少像素
 
 /** 该元素在指定方向上还能继续滚吗？必须看计算样式的 overflow，不能只看尺寸 */
 function canScroll(node, axis, delta) {
@@ -1366,68 +1852,72 @@ function canScroll(node, axis, delta) {
   return delta < 0 ? pos > 0 : pos + client < scroll - 1;
 }
 
+/**
+ * 事件目标 → 祖先链（含自身）。指针在弹窗里时到弹窗根为止 ——
+ * 滚到头就停，别漏到弹窗背后的页面上。
+ */
+function chainTo(node, scope) {
+  const chain = [];
+  for (let n = node; n; n = n.parentElement) {
+    chain.push(n);
+    if (n === scope) break;
+  }
+  return chain;
+}
+
+/** 把决策落到真实元素上 */
+function applyPlan(plan) {
+  if (plan.dy) plan.node.scrollTop += plan.dy;
+  if (plan.dx) plan.node.scrollLeft += plan.dx;
+}
+
 function attachWheelScroll() {
   document.addEventListener(
     'wheel',
     (e) => {
       // Ctrl/Cmd + 滚轮 = 浏览器缩放，别抢
       if (e.ctrlKey || e.metaKey) return;
-      if (!e.deltaY && !e.deltaX) return;
-      const toPx = (v) => (e.deltaMode === 1 ? v * WHEEL_LINE_PX : v);
-      const dy = toPx(e.deltaY);
-      const dx = toPx(e.deltaX);
+      const { dx, dy } = wheelDeltas(e);
+      if (!dx && !dy) return;
       const start = e.target instanceof Element ? e.target : null;
       if (!start) return;
       // 指针落在弹窗里 → 滚动只允许发生在弹窗内部
       const scope = start.closest('.overlay');
 
-      let handled = false;
-      for (let node = start; node; node = node.parentElement) {
-        let moved = false;
-        if (dy && canScroll(node, 'y', dy)) {
-          node.scrollTop += dy;
-          moved = true;
-        }
-        if (dx && canScroll(node, 'x', dx)) {
-          node.scrollLeft += dx;
-          moved = true;
-        }
-        if (moved) {
-          handled = true;
-          break;
-        }
-        if (node === scope) break; // 弹窗内滚到头就停，别漏到背后的页面
+      const plan = planWheel({ shift: e.shiftKey, dx, dy }, chainTo(start, scope), canScroll);
+      if (plan.node) {
+        applyPlan(plan);
+        e.preventDefault(); // 确实滚动了才拦默认行为
+        return;
+      }
+      // Shift + 滚轮只做横向：已经到最左/最右（或这块压根不能横滚）→ 就此打住，
+      // 不退回纵向。拦默认行为是因为这次滚轮已经被我们"消费"了。
+      if (plan.locked) {
+        e.preventDefault();
+        return;
       }
 
       // 弹窗里没找到可滚元素时（指针落在底部按钮条上等）→ 退回到弹窗正文，
       // 这是原来那版的行为：指针在弹窗内就该滚正文，别因为压在按钮上就失灵
-      if (!handled && scope) {
+      if (scope) {
         const body = start.closest('.dlg')?.querySelector('.dlg-body');
-        if (body) {
-          let moved = false;
-          if (dy && canScroll(body, 'y', dy)) {
-            body.scrollTop += dy;
-            moved = true;
-          }
-          if (dx && canScroll(body, 'x', dx)) {
-            body.scrollLeft += dx;
-            moved = true;
-          }
-          handled = moved;
+        const fallback = body && planWheel({ shift: e.shiftKey, dx, dy }, [body], canScroll);
+        if (fallback?.node) {
+          applyPlan(fallback);
+          e.preventDefault();
+        } else if (fallback?.locked) {
+          e.preventDefault(); // 弹窗里同样是「Shift 只横向」
         }
+        return;
       }
 
       // 谁都没接（例如指针在页面空白上）→ 页面本身还能滚就交给它
-      if (!handled && !scope) {
-        const doc = document.scrollingElement;
-        if (doc && dy && doc.scrollHeight > doc.clientHeight + 1) {
-          const before = doc.scrollTop;
-          doc.scrollTop = before + dy;
-          handled = doc.scrollTop !== before;
-        }
+      const doc = document.scrollingElement;
+      if (doc && dy && doc.scrollHeight > doc.clientHeight + 1) {
+        const before = doc.scrollTop;
+        doc.scrollTop = before + dy;
+        if (doc.scrollTop !== before) e.preventDefault();
       }
-
-      if (handled) e.preventDefault(); // 确实滚动了才拦默认行为
     },
     { passive: false }
   );
@@ -1477,11 +1967,12 @@ el.packOverlay.querySelectorAll('input, textarea').forEach((inp) => {
 
 // 点遮罩关闭由 attachOverlayDismiss() 统一接管（见 openPackOverlay 附近）。
 // Escape 关闭（原生 <dialog> 自带这个行为，换成覆盖层后要自己接）：
-// 打包弹窗在上层，先关它；它没开才轮到帮助弹窗。
+// 打包弹窗在上层，先关它；它没开才轮到帮助弹窗；两个都关着才轮到编辑器全屏。
 window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (el.packOverlay.classList.contains('show')) closePackOverlay();
   else if (el.helpOverlay.classList.contains('show')) closeHelpOverlay();
+  else if (el.editorWrap.classList.contains('maxed')) setEditorMaxed(false);
 });
 
 el.btnCopyLog.onclick = () => {
@@ -1513,9 +2004,10 @@ function clearClientProject() {
   state.shell.clear();
   state.packRes.clear();
   state.packResTouched = false;
+  state.fileEncoding.clear();
   state.selected = null;
-  state.editorBase = null;
-  el.editor.value = '';
+  fileLog.clear(); // 「读取 / 已修改」的记录也一起清（工程要回到模板那份）
+  clearEditor();
   el.editorHint.textContent = '未选择文件';
   // 入口源文件也回默认：导入的 main.c 之所以会让「恢复」看起来没生效，
   // 一半原因就是这个输入框还停在 main.c 上
@@ -1560,6 +2052,10 @@ async function resetToTemplate() {
     state.artifact = null;
     el.btnDownload.disabled = true;
     refreshPackButton();
+    // 工程目录换回来了 → 清单（名字 + 大小）重新问一次虚拟机，别拿旧的那份
+    await refreshProjectIndex();
+    state.pristineNames = [...state.template]; // 换回来的就是模板那份，快照重新对齐
+    renderFiles();
     writeLine('✓ 已恢复：虚拟机里的工程目录换回了镜像内置那份（含 bin.elf 一起清掉）');
     writeLine('  再点「编译」会真正重新编译模板工程');
   } catch (e) {
@@ -1572,9 +2068,32 @@ async function resetToTemplate() {
 
 el.btnReset.onclick = resetToTemplate;
 
+/* 输入时：行号 + 着色防抖重画（120ms），写回虚拟机再慢一拍（600ms）。
+   两个定时器分开 —— 着色只影响观感，可以拖；写 9p 要尽量少触发。 */
+function scheduleEditorRender() {
+  clearTimeout(editorRenderTimer);
+  editorRenderTimer = setTimeout(renderEditor, 120);
+}
+
 el.editor.addEventListener('input', () => {
+  scheduleEditorRender();
   clearTimeout(el.editor._t);
   el.editor._t = setTimeout(saveEditor, 600);
+});
+
+el.editor.addEventListener('scroll', onEditorScroll, { passive: true });
+
+/*
+ * 中文输入法组字期间，组字文本是 textarea 自己画的 —— 而 textarea 的文字是透明的，
+ * 不处理就会「打字时什么都看不见」。这段期间把着色层藏起来、把 textarea 的文字点亮，
+ * 组字结束再交还给着色层（见 style.css 的 .editor-wrap.ime）。
+ */
+el.editor.addEventListener('compositionstart', () => {
+  el.editorWrap.classList.add('ime');
+});
+el.editor.addEventListener('compositionend', () => {
+  el.editorWrap.classList.remove('ime');
+  scheduleEditorRender();
 });
 
 el.editor.addEventListener('keydown', (e) => {
@@ -1582,6 +2101,8 @@ el.editor.addEventListener('keydown', (e) => {
     e.preventDefault();
     const s = el.editor.selectionStart;
     el.editor.setRangeText('    ', s, el.editor.selectionEnd, 'end');
+    // setRangeText 不一定触发 input，这里自己补一次重画
+    scheduleEditorRender();
   }
 });
 
@@ -1849,3 +2370,4 @@ el.drop.addEventListener('drop', (e) => {
 
 // 初始状态
 setPhase('off', '环境未启动');
+renderEditor(); // 行号槽 / 着色层的初始状态（空）

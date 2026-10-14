@@ -15,11 +15,19 @@
 
 import { V86 } from './v86/libv86.js';
 import { isGzip, looksLikeTar, gzipBytes, fmtBytes } from './bytes.js';
+import { serialBytes, decodeSerial, shProjectPath, shQuote } from './serial.js';
 
 export const SHARE = '/mnt';           // 9p 挂载点（宿主 <-> 虚拟机）
 export const TC = '/opt/tc';           // 工具链解压位置
 export const PROJ = `${TC}/mrp_demo`;  // 工程模板位置
 export const GLIBC = `${TC}/lib/i386-linux-gnu`;
+
+/**
+ * 命令正文落在 9p 共享目录里的脚本名：敲进 shell 的只有 `sh /mnt/__cmd`，
+ * 命令本身从不回显（否则长命令的折行碎片会漏进可见日志，见 _runOnce 的说明）。
+ */
+const CMD_SCRIPT = '__cmd';
+const LS_SCRIPT = '__lscmd';
 // Debian 把库分散在两个目录：glibc 核心在 /lib，gcc 自己的依赖
 // （libisl / libmpfr / libgmp / libmpc / libzstd / libstdc++）在 /usr/lib。
 // 少一个就会报 "cc1: error while loading shared libraries"。
@@ -44,6 +52,15 @@ const DEFAULT_CMDLINE = 'tsc=reliable mitigations=off random.trust_cpu=on';
  */
 const SENTINEL_RE = /__(?:RC|LS|RDY)[0-9a-z]{1,16}/;
 
+/**
+ * 列目录的起止标记（`__LSxxxxxx_B` / `_E`）。这两行之间是**数据**，不是日志：
+ * `<字节数>\t<路径>`，50 个文件就是 50 行 —— 不滤掉的话，一点「启动编译环境」
+ * 编译输出栏里就会刷出一屏 `20241\t./README.md`。
+ * （`this.serial` 里仍然完整保留 —— waitFor / 解析都靠它，这里只挡转发。）
+ */
+const LS_BEGIN_RE = /__LS[0-9a-z]{1,16}_B/;
+const LS_END_RE = /__LS[0-9a-z]{1,16}_E/;
+
 
 export class MrpVm {
   /**
@@ -64,6 +81,8 @@ export class MrpVm {
     this.ready = false;
     this.onOutput = opts.onOutput || (() => {});
     this._outBuf = '';
+    this._quiet = false; // 正在转发列目录的数据段（见 LS_BEGIN_RE）
+    this.env = new Map(); // 每条命令开头都要带上的环境变量（见 setEnv）
   }
 
   // ---------------------------------------------------------------- 串口
@@ -128,7 +147,16 @@ export class MrpVm {
 
       const line = this._outBuf.slice(0, m.index + m[0].length);
       this._outBuf = this._outBuf.slice(m.index + m[0].length);
-      if (!SENTINEL_RE.test(line)) this.onOutput(line);
+      // 列目录：标记本身不转发，中间那一段数据也不转发（否则日志里刷一屏文件名）
+      if (LS_BEGIN_RE.test(line)) {
+        this._quiet = true;
+        continue;
+      }
+      if (LS_END_RE.test(line)) {
+        this._quiet = false;
+        continue;
+      }
+      if (!this._quiet && !SENTINEL_RE.test(line)) this.onOutput(line);
     }
   }
   waitFor(re, timeoutMs, label) {
@@ -164,13 +192,54 @@ export class MrpVm {
     return this._enqueue(() => this._runOnce(cmd, opts));
   }
 
+  /**
+   * 往串口写一段命令（自己带换行）。
+   *
+   * 必须走 serialBytes：`serial0_send` 是按 charCodeAt 逐字符发的，非 ASCII 字符
+   * （码点 > 255）会被截断成低 8 位 —— 直接发中文路径会打出 0x03(^C) / 0x00(NUL)，
+   * ^C 当场打断命令行、留下未闭合引号，shell 卡在续行符上直到超时。
+   * 先按 UTF-8 编成字节再逐字节发，中文路径才能原样到达（见 assets/serial.js）。
+   */
+  _send(text) {
+    this.emulator.serial0_send(serialBytes(text));
+  }
+
+  /**
+   * 给之后所有命令加一段环境设置（PATH / LD_LIBRARY_PATH / CPATH…）。
+   *
+   * 不能用「往交互 shell 里 `export` 一次就算数」：命令是在子 shell 的脚本里跑的
+   * （见 `_runOnce`），子 shell 只继承环境变量，不继承"上一条命令的 export 生效了没"
+   * 这种状态 —— 那样 PATH 会丢，`make` 直接 `command not found`（127，实测踩到）。
+   * 存在实例上、由 `_runOnce` 写进每个脚本开头，自包含且顺带省掉几次串口往返。
+   */
+  setEnv(name, value) {
+    this.env.set(name, String(value));
+  }
+
+  /** 每次要跑的命令 = 环境设置 + 命令正文（见 _runOnce 的说明） */
+  _scriptFor(cmd) {
+    const env = [...this.env].map(([k, v]) => `export ${k}=${shQuote(v)}`);
+    return `${env.join('\n')}${env.length ? '\n' : ''}${cmd}\n`;
+  }
+
   async _runOnce(cmd, { timeout = 600_000, token } = {}) {
     const id = token || `__RC${Math.random().toString(36).slice(2, 8)}`;
     // 标记在命令里拆开写，避免串口回显的命令行本身被误判成已完成
     const a = id.slice(0, 8);
     const b = id.slice(8);
     this.serial = this.serial.slice(-200_000);
-    this.emulator.serial0_send(`${cmd}; echo "${a}""${b}=$?"\n`);
+    /*
+     * 命令正文**先写进 9p 里的脚本文件**，敲进去的只有 `sh /mnt/__cmd`（一行很短）。
+     *
+     * 为什么不直接把命令打进 shell：交互 shell 的行编辑器会把它收到的每个字符
+     * **回显**出来，而长命令在 80 列处还会被插入真换行 —— 含哨兵的那一段会被
+     * `_forward` 滤掉，**剩下的碎片（`2=$?"` / `?"` 这种）没有哨兵就漏进了可见日志**，
+     * 混在「✓ 已从虚拟机里删除 xxx」这类消息里，根本分不清哪行是状态、哪行是噪音。
+     * 走脚本文件之后：敲进去那行短且含哨兵（一行内 → 被过滤），命令正文从不回显；
+     * 顺带也不必再操心命令行的长度。正文经 9p 写入（UTF-8 原样）→ 脚本里写中文路径也行。
+     */
+    await this.putFile(CMD_SCRIPT, new TextEncoder().encode(this._scriptFor(cmd)));
+    this._send(`sh ${SHARE}/${CMD_SCRIPT}; echo "${a}""${b}=$?"\n`);
     await this.waitFor(new RegExp(`${id}=(\\d+)`), timeout, cmd.slice(0, 60));
     const m = this.serial.match(new RegExp(`${id}=(\\d+)`));
     return m ? Number(m[1]) : NaN;
@@ -224,7 +293,7 @@ export class MrpVm {
       const a = id.slice(0, 6);
       const b = id.slice(6);
       this.serial = this.serial.slice(-100_000);
-      this.emulator.serial0_send(`echo "${a}""${b}"\n`);
+      this._send(`echo "${a}""${b}"\n`);
       try {
         await this.waitFor(new RegExp(id), 4000, 'shell');
         return true;
@@ -341,29 +410,33 @@ export class MrpVm {
 
     rc = await this.run(`ln -sf ${GLIBC}/ld-linux.so.2 /lib/ld-linux.so.2`);
     if (rc !== 0) throw new Error('创建 ld-linux.so.2 软链失败');
-    rc = await this.run(`export LD_LIBRARY_PATH=${LIBDIRS}`);
-    if (rc !== 0) throw new Error('设置 LD_LIBRARY_PATH 失败');
-    rc = await this.run(`export PATH=${TC}/usr/bin:/usr/bin:/bin:/sbin`);
-    if (rc !== 0) throw new Error('设置 PATH 失败');
+    /*
+     * 这几个环境变量**不是** export 到交互 shell 里就算完 —— 命令是在子 shell 的
+     * 脚本里跑的（见 _runOnce），子 shell 只继承环境、不继承"上一条命令里的 export
+     * 有没有生效"这种状态。所以记在实例上，由 _runOnce 写进每个脚本的开头：
+     * 自包含、不依赖 shell 状态，也省掉 4 次串口往返。
+     */
+    this.setEnv('LD_LIBRARY_PATH', LIBDIRS);
+    this.setEnv('PATH', `${TC}/usr/bin:/usr/bin:/bin:/sbin`);
 
     // 关键：工具链在 /opt/tc/usr 而不是编译期前缀 /usr，GCC 按自己的搜索路径
     // 找不到 assembler / linker，最后会退化成 execvp("as") 并报
     // "cannot execute 'as': No such file or directory"。
     // 直接补上不带前缀的软链，让 GCC 的两条查找路径都能命中。
+    // （结尾故意**不加** `echo linked` 这类"回显自己文案"的标记：那行输出正好是命令的
+    //   子串，会被「日志里不能有自己命令的碎片」那条断言当成漏网的回显 —— 见 test-v86。）
     rc = await this.run(
       `cd ${TC}/usr/bin && for t in as ld nm objcopy objdump ar ranlib strip ` +
       `readelf strings size addr2line; do ` +
-      `[ -e "$t" ] || ln -sf arm-none-eabi-$t "$t"; done; echo linked`,
+      `[ -e "$t" ] || ln -sf arm-none-eabi-$t "$t"; done; true`,
       { timeout: 120_000 }
     );
     if (rc !== 0) throw new Error('创建无前缀工具软链失败');
-    rc = await this.run(`export COMPILER_PATH=${TC}/usr/bin`);
-    if (rc !== 0) throw new Error('设置 COMPILER_PATH 失败');
+    this.setEnv('COMPILER_PATH', `${TC}/usr/bin`);
 
     // 标准 C 头文件：Debian 把 newlib 的头放在 usr/include/newlib。
     // 用 CPATH 显式加进去，保证 #include <stdlib.h> 之类一定能解析。
-    rc = await this.run(`export CPATH=${TC}/usr/include/newlib`);
-    if (rc !== 0) throw new Error('设置 CPATH 失败');
+    this.setEnv('CPATH', `${TC}/usr/include/newlib`);
 
     // 自检：确认工具链真的能跑
     rc = await this.run(`${TC}/usr/bin/arm-none-eabi-gcc --version | head -1`);
@@ -392,30 +465,14 @@ export class MrpVm {
       const stage = `__up_${i++}`;
       await this.putFile(stage, bytes);
       /*
-       * 文件名不能直接拼进串口命令：serial0_send 是按 charCodeAt 逐字符发的，
-       * 非 ASCII 字符（中文等）的码点 > 255，会被截断成低 8 位 ——
-       * 实测「功能机开发规范.md」会打出 0x03(^C)/0x00(NUL) 等字节，
-       * ^C 直接打断命令行、留下未闭合引号，shell 卡在 PS2 续行符，整条同步链超时。
-       * 对策：非 ASCII 名走 base64（UTF-8），guest 里 base64 -d 还原后再落盘。
-       * 单引号也不能直接进命令，所以可打印 ASCII 的判定里把它排除。
+       * 路径整体加单引号再拼（shProjectPath）：文件名里带空格、中文、$ 都安全。
+       * 中文路径能直接发是因为 _send 走的是「UTF-8 字节逐个发」——
+       * 早期版本在这里绕了一圈 base64 -d，就是为了躲开 charCodeAt 的截断。
        */
-      const safeName = /^[\x20-\x26\x28-\x7e]+$/.test(name);
-      const cmd = safeName
-        ? (() => {
-            const dir = name.includes('/') ? name.slice(0, name.lastIndexOf('/')) : '.';
-            return `mkdir -p '${PROJ}/${dir}' && cp -f '${SHARE}/${stage}' '${PROJ}/${name}'`;
-          })()
-        : (() => {
-            const b = new TextEncoder().encode(name);
-            let bin = '';
-            for (let k = 0; k < b.length; k++) bin += String.fromCharCode(b[k]);
-            const b64 = btoa(bin);
-            return (
-              `d=$(printf '%s' '${b64}' | base64 -d) && ` +
-              `mkdir -p "${PROJ}/$(dirname "$d")" && ` +
-              `cp -f '${SHARE}/${stage}' "${PROJ}/$d"`
-            );
-          })();
+      const dir = name.includes('/') ? name.slice(0, name.lastIndexOf('/')) : '.';
+      const cmd =
+        `mkdir -p ${shProjectPath(PROJ, dir)} && ` +
+        `cp -f ${shProjectPath(SHARE, stage)} ${shProjectPath(PROJ, name)}`;
       const rc = await this.run(cmd, { timeout: 120_000 });
       if (rc !== 0) throw new Error(`写入 ${name} 失败`);
     }
@@ -483,12 +540,43 @@ export class MrpVm {
 
   /** 读一个工程内的文件（走 9p，不用串口，二进制也安全） */
   async readProjectFile(relPath) {
-    const rc = await this.run(`cp -f '${PROJ}/${relPath}' ${SHARE}/__get`, { timeout: 120_000 });
+    const rc = await this.run(`cp -f ${shProjectPath(PROJ, relPath)} ${SHARE}/__get`, {
+      timeout: 120_000,
+    });
     if (rc !== 0) throw new Error(`读取 ${relPath} 失败`);
     return await this.getFile('__get');
   }
 
-  /** 列出工程模板文件（9p 不支持列目录，只能问 guest） */
+  /**
+   * 改工程内某个文件的名字（同目录内改名，目录部分由调用方保持不变）。
+   * 直接在 guest 里 `mv`，所以虚拟机里的工程目录立刻就是新的样子 ——
+   * 和编辑器改内容走的是同一条思路：前端不另存一份，改完再回来列一次。
+   */
+  async renameProjectFile(from, to) {
+    const rc = await this.run(
+      `mv -f ${shProjectPath(PROJ, from)} ${shProjectPath(PROJ, to)}`,
+      { timeout: 60_000 }
+    );
+    if (rc !== 0) throw new Error(`重命名失败：${from} → ${to}`);
+  }
+
+  /** 删掉工程内的某个文件（`test ! -e` 复核一次，别只信 rm 的退出码） */
+  async deleteProjectFile(name) {
+    const p = shProjectPath(PROJ, name);
+    const rc = await this.run(`rm -f ${p} && test ! -e ${p}`, { timeout: 60_000 });
+    if (rc !== 0) throw new Error(`删除失败：${name}`);
+  }
+
+  /**
+   * 列工程文件：`[{ name, size }]`（9p 不支持列目录，只能问 guest）。
+   *
+   * 取大小用 `find . -type f -exec du -b {} +`：实测这台 guest 里的 busybox
+   * **没有编译 `stat`（`stat: applet not found`）也没有 `find -printf`**（软链在、
+   * applet 不在 —— 别信 make-image.py 那份软链清单），而 `du -b` 与
+   * `-exec … +` 都可用，且一次 fork 就能拿到全部文件的「字节数 + 路径」。
+   *
+   * 路径按 UTF-8 解回来（串口回来的是按字节拼的 Latin-1 串）：中文文件名才不会是乱码。
+   */
   async listProjectFiles() {
     return this._enqueue(() => this._listProjectFilesOnce());
   }
@@ -498,18 +586,37 @@ export class MrpVm {
     const a = id.slice(0, 7);
     const b = id.slice(7);
     this.serial = this.serial.slice(-100_000);
-    this.emulator.serial0_send(
-      `cd ${PROJ} && echo "${a}""${b}_B" && find . -type f | sed 's|^\\./||' | sort && echo "${a}""${b}_E"\n`
+    // 同样走脚本文件：命令正文不回显（`cd` 也留在子 shell 里，不污染交互 shell 的提示符）
+    await this.putFile(
+      LS_SCRIPT,
+      new TextEncoder().encode(
+        this._scriptFor(
+          `cd ${PROJ} && echo "${a}""${b}_B" && ` +
+            `find . -type f -exec du -b {} + && echo "${a}""${b}_E"`
+        )
+      )
     );
+    // 敲进去这行挂一个同前缀的标记（`#` 后面是注释，不影响执行）→ 回显会被 `_forward` 滤掉
+    this._send(`sh ${SHARE}/${LS_SCRIPT} #${id}\n`);
     await this.waitFor(new RegExp(`${id}_E`), 120_000, '列目录');
     const s = this.serial;
     const end = s.lastIndexOf(`${id}_E`);
     const begin = s.lastIndexOf(`${id}_B`, end);
     if (begin < 0 || end < 0) return [];
-    return s
-      .slice(begin + `${id}_B`.length, end)
-      .split('\n')
-      .map((x) => x.replace(/\r/g, '').trim())
-      .filter(Boolean);
+    const files = [];
+    for (const raw of s.slice(begin + `${id}_B`.length, end).split('\n')) {
+      const row = raw.replace(/\r/g, '');
+      // du -b 的输出是「<字节数>\t<路径>」；按第一个制表符切，名字里再有制表符也不怕
+      const tab = row.indexOf('\t');
+      if (tab <= 0) continue; // 空行 / du 的报错行
+      const size = Number(row.slice(0, tab));
+      let name = decodeSerial(row.slice(tab + 1));
+      if (name.startsWith('./')) name = name.slice(2);
+      if (!name || !Number.isFinite(size)) continue;
+      files.push({ name, size });
+    }
+    // 排序放在这里（不靠 guest 的 sort）：界面上的顺序与文件名一致
+    files.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+    return files;
   }
 }

@@ -29,6 +29,23 @@
   --err-ring: rgba(163, 45, 45, 0.14);
   /* 输入框聚焦时那圈淡晕（跟着 --text 走：浅色下是墨色晕、深色下是浅色晕） */
   --focus-ring: rgba(31, 31, 30, 0.18);
+  /* 源码着色（只上色，不加粗不斜体 —— 见 style.css 里 .c-* 那段说明） */
+  --code-com: #7a7871; /* 注释 */
+  --code-pre: #9c3b3b; /* #include 这类预处理指令 */
+  --code-str: #0d6b4f; /* 字符串 / 字符常量 */
+  --code-num: #8a5200; /* 数字与 NULL / true / false */
+  --code-kw:  #14508c; /* 关键字 */
+  --code-typ: #7a3fa0; /* 内置类型与整型别名 */
+  --code-fn:  #0b5f74; /* 函数名 */
+  /*
+   * 选中文字。textarea 盖在着色层上面、文字是透明的，所以选区背景**必须是半透明的**，
+   * 否则会把下面那层彩色文字整片盖住 —— 表现就是「一选中，这段代码就变空白」。
+   * 另外两个是「没有着色层」时用的（超长文件 / 输入法组字），那时文字由 textarea 自己画，
+   * 就得用不透明底 + 显式文字色。详见 #editor::selection 那段。
+   */
+  --sel-bg: rgba(24, 95, 165, 0.26);
+  --sel-bg-solid: #185fa5;
+  --sel-fg: #ffffff;
   /* 主题切换的时序（与主题无关、两套共用；改数字要同步 assets/theme.js 的 ANIM_MS） */
   --theme-fade: 0.28s;      /* 表面（背景 / 边框 / 投影）的渐变时长 */
   --theme-ink-delay: 0.12s; /* 文字与图标颜色"跳变"的时刻，理由见 :root.theme-anim 那段 */
@@ -60,6 +77,16 @@
   --err-soft: #3a2020;
   --err-ring: rgba(240, 138, 138, 0.18);
   --focus-ring: rgba(236, 235, 230, 0.22);
+  --code-com: #85837b;
+  --code-pre: #f0928f;
+  --code-str: #6fcf9f;
+  --code-num: #e0b25c;
+  --code-kw:  #86bdf0;
+  --code-typ: #c9a0ff;
+  --code-fn:  #6fc7d8;
+  --sel-bg: rgba(124, 182, 234, 0.30);
+  --sel-bg-solid: #2f6ea8;
+  --sel-fg: #f4f8fc;
   color-scheme: dark;
 }
 
@@ -336,6 +363,65 @@ body {
   flex: 0 0 auto;
 }
 .filelist .tag.new { color: var(--ok); }
+.filelist .tag.danger { color: var(--err); }
+
+/* 一行的组成：文件名（占满 + 省略号）| 大小 | 状态 | 重命名 | 删除。
+   文件名必须能缩：`min-width: 0` 不加，长路径会把后面那排挤出去。 */
+.filelist .fname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filelist .fmeta {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 大小用等宽数字：一列大小看着才齐 */
+.filelist .fsize {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 行内那两颗图标按钮（重命名 / 删除）。默认很淡 —— 整列文件不该看着像一排按钮；
+   悬停那一行或聚焦时才明显。18px 见方，比行高矮，加进来不会把行撑高。 */
+.filelist .fbtn {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.filelist .fbtn svg { width: 12px; height: 12px; }
+.filelist .fbtn:hover { background: var(--bg); color: var(--text); }
+.filelist .fbtn:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* 等第二次点击确认的删除按钮 */
+.filelist .fbtn.danger { color: var(--err); background: var(--err-soft); }
+
+/* 就地改名的输入框（样式与 .opt-row input 的聚焦态保持一路） */
+.filelist .frename {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 0.5px solid var(--line-strong);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.filelist .frename:focus { outline: none; border-color: var(--text); border-width: 1.5px; }
 
 /* ---------- 编辑器 ---------- */
 
@@ -350,31 +436,158 @@ body {
   overflow: hidden;
 }
 
-#editor {
+/* 行号 + 代码横向排；行号不跟着横向滚，所以它有自己的一层裁剪 */
+.editor-main { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
+
+/*
+ * 行号槽：内容就是「1\n2\n3…」，靠 text-align: right 对齐。
+ * `display: inline-block` 让宽度随内容走（行数涨到 4 位数、槽自动变宽）。
+ * 只镜像竖向滚动，所以外面套一层 overflow: hidden、由 JS 平移里面的 <pre>。
+ */
+.editor-gutter {
+  flex: 0 0 auto;
+  overflow: hidden;
+  background: var(--bg-soft);
+  border-right: 0.5px solid var(--line);
+}
+#editorLines {
+  margin: 0;
+  padding: 10px 8px 10px 10px;
+  display: inline-block;
+  text-align: right;
+  white-space: pre;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* 代码区：着色层在下、textarea 在上，两层叠在一起 */
+.editor-code {
+  position: relative;
   flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+.editor-hl {
+  position: absolute;
+  top: 0;
+  left: 0;
+  margin: 0;
+  padding: 10px 12px;
+  white-space: pre;
+  pointer-events: none; /* 别挡住底下 textarea 的点击 */
+  color: var(--text);
+}
+
+/*
+ * 这三个元素的字体 / 字号 / 行高 / tab 宽必须一字不差 ——
+ * 着色层靠同样的排版叠在 textarea 底下对齐，差一点整行就错位（越往右越明显）。
+ */
+#editor,
+.editor-hl,
+#editorLines {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  tab-size: 4;
+}
+
+/*
+ * textarea 盖在着色层上面：**文字透明、光标可见**，让底下的彩色文字透出来。
+ * 为什么不反过来（着色层盖上面）：那样原生选区背景（由 textarea 画）会被盖住，
+ * 鼠标拖选就看不见高亮了。
+ */
+#editor {
+  position: absolute;
+  inset: 0;
   width: 100%;
   border: 0;
   outline: none;
   resize: none;
   padding: 10px 12px;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  line-height: 1.55;
-  tab-size: 4;
-  color: var(--text);
-  background: var(--bg);
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text);
   white-space: pre;
   overflow: auto;
 }
+/* 文字透明了，placeholder 得自己上色，否则看不见 */
+#editor::placeholder { color: var(--text-faint); }
+
+/*
+ * 选区。焦点全在这两行上（改之前是一句 `background: var(--accent-soft)` 的不透明色）：
+ *  · 有着色层时 —— 背景**必须半透明**，让底下的彩色文字透出来；
+ *    文字仍保持 transparent，别让两层字形重叠（同一位置画两遍，边缘会冒出彩色描边）。
+ *  · 没有着色层时（.no-hl 超长文件 / .ime 输入法组字，文字由 textarea 自己画）——
+ *    背景不透明 + 选中的字显式上色；不写的话选中的字跟着 transparent，同样是「选中即空白」。
+ */
+#editor::selection { background: var(--sel-bg); color: transparent; }
+.editor-wrap.no-hl #editor::selection,
+.editor-wrap.ime #editor::selection { background: var(--sel-bg-solid); color: var(--sel-fg); }
+
+/*
+ * 两种「看不见彩色层」的情况，都得把 textarea 的文字点亮，否则画面上一个字都没有：
+ *   · 文件太长不着色（.no-hl，JS 按 MAX_HIGHLIGHT_CHARS 挂）；
+ *   · 输入法正在组字（.ime）—— 组字文本是 textarea 自己画的。
+ */
+.editor-wrap.no-hl .editor-hl { display: none; }
+.editor-wrap.no-hl #editor { color: var(--text); }
+.editor-wrap.ime .editor-hl { visibility: hidden; }
+.editor-wrap.ime #editor { color: var(--text); }
+
+/*
+ * 着色 token —— **只允许改 color**。
+ * 加粗 / 斜体 / 换字体都会让字形宽度变化，和底下的 textarea 错位；
+ * tools/test-codeview.mjs 会检查这里没有 font-weight / font-style / font-family。
+ */
+.c-com { color: var(--code-com); }
+.c-pre { color: var(--code-pre); }
+.c-str { color: var(--code-str); }
+.c-num { color: var(--code-num); }
+.c-kw  { color: var(--code-kw); }
+.c-typ { color: var(--code-typ); }
+.c-fn  { color: var(--code-fn); }
 
 .editor-hint {
   flex: 0 0 auto;
-  padding: 3px 10px;
+  /* 左边文件/状态、右边「全屏」按钮（见下面 .maxed 那段） */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px 3px 10px;
   border-top: 0.5px solid var(--line);
   background: var(--bg-soft);
   font-size: 11px;
   color: var(--text-faint);
 }
+/* 文件名可能很长 → 让它自己缩，别把「全屏」按钮挤出可视区 */
+.editor-hint > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 比 .btn.small 再小一号：这样它不高于这行文字，hint 条的高度不变（不会挤掉编辑区） */
+#btnEditorMax { flex: 0 0 auto; font-size: 11px; padding: 1px 7px; }
+
+/*
+ * 网页内全屏：编辑器铺满整个视口。
+ * 布局本身不用改 —— 编辑器已经是「flex 列 + 中间那层 flex:1」，inset:0 之后自然撑满。
+ * z-index 特意**低于 .overlay 的 60**：全屏时打包 / 帮助弹窗仍要能盖在它上面。
+ */
+.editor-wrap.maxed {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--bg);
+}
+/* 全屏时别让背后的页面跟着滚（滚轮兜底最后一级会滚到 document 上） */
+body.editor-maxed { overflow: hidden; }
 
 /* ---------- 拖拽区 ---------- */
 

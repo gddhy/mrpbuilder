@@ -49,20 +49,40 @@ console.log(`     工具链   ${(fs.statSync(rootfsPath).size / 1048576).toFixed
 
 const t0 = Date.now();
 let lastLine = '';
+/**
+ * 界面看到的那份日志（`_forward` 过滤后的）—— 顺手断言它里面**不含我们自己命令的碎片**。
+ * 反例：长命令的回显会被行编辑器在 80 列处折成多行，含哨兵那段被滤掉、碎片留下，
+ * 用户就会在「✓ 已删除 xxx」旁边看到 `2=$?"` 这种一行（真被报过）。
+ * 命令正文现在写在 9p 脚本文件里、敲进去的只有 `sh /mnt/__cmd`，所以碎片应当绝迹。
+ */
+const visibleLog = [];
+const sentCommands = [];
 const vm = new MrpVm({
   wasmPath: path.join(V86DIR, 'v86.wasm'),
   bios: { buffer: toArrayBuffer(path.join(V86DIR, 'bios', 'seabios.bin')) },
   vgaBios: { buffer: toArrayBuffer(path.join(V86DIR, 'bios', 'vgabios.bin')) },
   kernel: { buffer: toArrayBuffer(kernelPath) },
-  // 这是排查用的 harness，保留完整串口流（含内部哨兵），别过滤
-  rawOutput: true,
+  // 和界面一样走过滤：这里要看的就是"用户实际看到什么"
   onOutput: (ch) => {
     process.stdout.write(ch);
+    visibleLog.push(ch);
     lastLine += ch;
     if (lastLine.length > 400) lastLine = lastLine.slice(-400);
   },
   onStatus: (s) => process.stdout.write(`\n[vm] === ${s} ===\n`),
 });
+
+/*
+ * 把 vm.run 包一层：**内部**调用（build / installToolchain / 列目录…）也要进 sentCommands，
+ * 否则"日志里有没有自己命令的碎片"这条断言只盯着测试自己发的几条、等于没查。
+ * 必须在 boot() 之前挂上。
+ */
+const rawRun = vm.run.bind(vm);
+const runCmd = (cmd, opts) => {
+  sentCommands.push(cmd);
+  return rawRun(cmd, opts);
+};
+vm.run = (cmd, opts) => runCmd(cmd, opts);
 
 try {
   await vm.boot();
@@ -89,11 +109,64 @@ try {
 
   // 和界面一样：启动完先把内置模板清单记下来（「下载demo」用的就是这一份；
   // 编译之后工程目录里会多出 bin.elf / 引擎归档，那已经不是"内置模板"了）
-  const template = (await vm.listProjectFiles()).filter((n) => !n.includes('libmrp_engine.'));
+  const listed = await vm.listProjectFiles();
+  const template = listed.map((f) => f.name).filter((n) => !n.includes('libmrp_engine.'));
   console.log(`[vm] 内置模板 ${template.length} 个文件`);
+  const noSize = listed.filter((f) => !(f.size > 0));
+  if (noSize.length || !listed.length) {
+    console.error(`[vm] ✗ 文件大小没取到：${listed.length} 项里 ${noSize.length} 项没有大小`);
+    process.exitCode = 1;
+  } else {
+    const big = listed.slice().sort((a, b) => b.size - a.size)[0];
+    console.log(`[vm] 文件大小 ✓ ${listed.length} 项都有（最大 ${big.name} = ${big.size} 字节）`);
+  }
+
+  /*
+   * 工程文件的重命名 / 删除（界面里那两个按钮走的就是这几个方法）。
+   * 用「带空格 + 中文」的临时文件：一次把「引号」和「非 ASCII 经串口」两件事都验了 ——
+   * 早期 serial0_send 按 charCodeAt 发，中文会被截断成控制字符、直接把命令行打断。
+   * 用完删掉，不碰内置模板。
+   */
+  if (!customCmd && !diag) {
+    const { shProjectPath } = await import(
+      pathToFileURL(path.join(ROOT, 'assets', 'serial.js')).href
+    );
+    const scratch = 'tmp 临时 文件.txt';
+    const renamed = 'tmp 改名 之后.txt';
+    const p = (rel) => shProjectPath('/opt/tc/mrp_demo', rel);
+    const names = async () => (await vm.listProjectFiles()).map((f) => f.name);
+    const find = async (n) => (await vm.listProjectFiles()).find((f) => f.name === n);
+
+    await runCmd(`printf 'hello' > ${p(scratch)}`, { timeout: 60_000 });
+    const created = await find(scratch);
+    console.log(
+      `[vm] 建临时文件「${scratch}」→ ${created ? `${created.size} 字节 ✓（名字原样回来）` : '没列出来 ✗'}`
+    );
+    if (!created || created.size !== 5) process.exitCode = 1;
+
+    const back = new TextDecoder().decode(await vm.readProjectFile(scratch));
+    if (back !== 'hello') {
+      console.error(`[vm] ✗ 读回内容不对：${JSON.stringify(back)}`);
+      process.exitCode = 1;
+    } else {
+      console.log('[vm] 按名字读回内容 ✓（非 ASCII 路径能拼进命令）');
+    }
+
+    await vm.renameProjectFile(scratch, renamed);
+    const list1 = await names();
+    const okRename = list1.includes(renamed) && !list1.includes(scratch);
+    console.log(`[vm] 重命名 →「${renamed}」${okRename ? ' ✓' : ' ✗'}`);
+    if (!okRename) process.exitCode = 1;
+
+    await vm.deleteProjectFile(renamed);
+    const list2 = await names();
+    const okDelete = !list2.includes(renamed);
+    console.log(`[vm] 删除 ✓ 剩余 ${list2.length} 个文件${okDelete ? '' : '（✗ 还列得出来）'}`);
+    if (!okDelete) process.exitCode = 1;
+  }
 
   if (customCmd) {
-    const rc = await vm.run(customCmd, { timeout: 900_000 });
+    const rc = await runCmd(customCmd, { timeout: 900_000 });
     console.log(`\n[vm] 命令退出码 ${rc}`);
     // 自定义命令模式下，如果它把产物写到了 /mnt/__artifact 就顺手取回来
     try {
@@ -108,12 +181,12 @@ try {
   }
 
   if (diag) {
-    await vm.run(
+    await runCmd(
       'echo "--- /opt/tc ---"; ls /opt/tc; echo "--- 模板 ---"; ls /opt/tc/mrp_demo | head; ' +
-      'echo "--- gcc ---"; arm-none-eabi-gcc --version | head -1; ' +
-      'echo "--- as/ld ---"; which arm-none-eabi-as arm-none-eabi-ld make tar; ' +
-      'echo "--- 9p ---"; ls -l /mnt; ' +
-      'echo "__DIAG""_DONE__"'
+        'echo "--- gcc ---"; arm-none-eabi-gcc --version | head -1; ' +
+        'echo "--- as/ld ---"; which arm-none-eabi-as arm-none-eabi-ld make tar; ' +
+        'echo "--- 9p ---"; ls -l /mnt; ' +
+        'echo "__DIAG""_DONE__"'
     );
     await vm.waitFor(/__DIAG_DONE__/, 120_000, '诊断输出');
   } else if (!customCmd) {
@@ -202,6 +275,33 @@ try {
       );
       if (!demoOk) process.exitCode = 1;
     }
+  }
+
+  /*
+   * 可见日志干不干净：**里面不该出现我们自己命令的碎片**。
+   * 长命令的回显会被行编辑器的 80 列折行切成几段，只有含哨兵那段会被滤掉 ——
+   * 碎片（`2=$?"` / `?"`）混在「✓ 已删除 xxx」旁边，用户根本分不清状态。
+   * 现在命令正文走 9p 脚本文件，敲进去的只有 `sh /mnt/__cmd`。
+   * 这里用「某一行是不是我们发过的某条命令的子串」来兜底，比枚举坏样子靠谱。
+   *
+   * ⚠ 已知误报形态：命令里**自己 echo 一段字面量**（例如结尾写 `; echo linked`），
+   *   那行输出天然是命令的子串 → 会命中。修法是别 echo 自己的文案，
+   *   或者用 `echo "lin""ked"` 这种拆开写的写法（哨兵线也是这么处理的）。
+   */
+  {
+    const text = visibleLog.join('');
+    const leaks = [];
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+      if (t.length < 3) continue;
+      if (sentCommands.some((c) => c.includes(t))) leaks.push(t);
+    }
+    console.log(
+      leaks.length
+        ? `[vm] ✗ 日志里有 ${leaks.length} 行是我们自己命令的回显碎片：${leaks.slice(0, 3).map((l) => JSON.stringify(l)).join('、')}`
+        : `[vm] 可见日志干净 ✓ 没有命令回显碎片（${sentCommands.length} 条命令，${text.split(/\r?\n/).length} 行输出）`
+    );
+    if (leaks.length) process.exitCode = 1;
   }
 } catch (e) {
   console.error(`\n[vm] 失败：${e.message}`);

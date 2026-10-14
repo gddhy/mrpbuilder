@@ -22,6 +22,7 @@ class FakeEmu {
   constructor(codes = []) {
     this.listeners = new Map();
     this.sent = [];
+    this.scripts = []; // create_file 收到的脚本（命令正文）
     this.codes = [...codes];
     this.inflight = false;
     this.violations = 0;
@@ -36,6 +37,11 @@ class FakeEmu {
       for (const ch of text) fn(ch.charCodeAt(0));
     }
   }
+  /** putFile → 9p 写文件：记下「命令正文被写进了哪个脚本」（不模拟落盘） */
+  create_file(name, bytes) {
+    this.scripts.push({ name, text: new TextDecoder().decode(bytes) });
+    return Promise.resolve();
+  }
   serial0_send(text) {
     // 上一条还没回哨兵就又发命令 —— 就是我们要防的并发
     if (this.inflight) this.violations++;
@@ -45,10 +51,12 @@ class FakeEmu {
     const t1 = setTimeout(() => this.emit(text.replace(/\n$/, '\r\n')), 5);
     this.timers.push(t1);
 
-    // NOREPLY 用来模拟"guest 不回话"（测试超时分支）
-    if (text.includes('NOREPLY')) return;
+    // NOREPLY 用来模拟"guest 不回话"（测试超时分支）。
+    // 命令正文现在写在脚本文件里，所以要看刚写进来的那份。
+    const script = this.scripts[this.scripts.length - 1]?.text || '';
+    if (text.includes('NOREPLY') || script.includes('NOREPLY')) return;
 
-    // 形式一：run() 的退出码哨兵 —— echo "__RCxxxx""xx=$?"
+    // 形式一：run() 的退出码哨兵 —— 命令正文在脚本文件里，这里只有 sh + 哨兵
     const rcMatch = text.match(/echo "([^"]*)""([^"]*)=\$\?"/);
     if (rcMatch) {
       const rc = this.codes.length ? this.codes.shift() : 0;
@@ -61,14 +69,15 @@ class FakeEmu {
       return;
     }
 
-    // 形式二：listProjectFiles() 的起止标记 —— echo "a""b_B" … echo "a""b_E"
-    const listMatch = text.match(/echo "([^"]*)""([^"]*)_B"/);
+    // 形式二：listProjectFiles() —— 敲进去的是 `sh /mnt/__lscmd #__LSxxxxxx`
+    const listMatch = text.match(/#(__LS[0-9a-z]+)/);
     if (listMatch) {
-      const id = listMatch[1] + listMatch[2];
+      const id = listMatch[1];
       this.timers.push(
         setTimeout(() => {
           this.emit(`${id}_B\r\n`);
-          this.emit('helloworld.c\r\nsrc/mrp_compat.c\r\n');
+          // du -b 的输出格式：<字节数>\t<路径>
+          this.emit('6120\t./helloworld.c\r\n1106\t./src/mrp_compat.c\r\n');
           this.emit(`${id}_E\r\n`);
           this.inflight = false;
         }, 40)
@@ -88,9 +97,9 @@ class FakeEmu {
   }
 }
 
-function makeVm(codes) {
+function makeVm(codes, onOutput) {
   const emu = new FakeEmu(codes);
-  const vm = new MrpVm({ onOutput: () => {} });
+  const vm = new MrpVm({ onOutput: onOutput || (() => {}) });
   vm.emulator = emu;
   vm._attach();
   return { vm, emu };
@@ -105,6 +114,20 @@ function ok(name, pass, detail = '') {
 console.log('===== MrpVm 命令串行化 =====');
 
 await (async () => {
+  // 0. 命令正文走 9p 脚本文件：敲进 shell 的只有一行短命令
+  //    （长命令的回显会被行编辑器在 80 列处折成多行，碎片没有哨兵 → 漏进可见日志）
+  {
+    const { vm, emu } = makeVm([0]);
+    const long = 'echo 一条挺长的命令，用来确认它不会被回显到日志里';
+    await vm.run(long, { timeout: 2000 });
+    const typed = emu.sent[0] || '';
+    ok('命令正文写进了脚本文件', emu.scripts.some((s) => s.text.includes('一条挺长')), emu.scripts[0]?.name);
+    ok('  敲进 shell 的那行很短（不会触发 80 列折行）', typed.length < 80, `${typed.length} 字符`);
+    ok('  正文没有出现在敲进去的那行里（不回显 → 日志干净）', !typed.includes('一条挺长'));
+    ok('  脚本内容原样（UTF-8 经 9p，中文没问题）', /一条挺长的命令/.test(emu.scripts[0]?.text || ''));
+    emu.destroy();
+  }
+
   // 1. 并发两条命令：不能交错，且各自拿到自己的退出码
   {
     const { vm, emu } = makeVm([2, 0]);
@@ -112,7 +135,8 @@ await (async () => {
     ok('并发调用不交错（无并发下发）', emu.violations === 0, `violations=${emu.violations}`);
     ok('两条命令都已下发', emu.sent.length === 2, `sent=${emu.sent.length}`);
     ok('各自拿到正确的退出码', a === 2 && b === 0, `a=${a} b=${b}`);
-    ok('下发顺序与调用顺序一致', /echo A/.test(emu.sent[0]) && /echo B/.test(emu.sent[1]), emu.sent.map((s) => s.split(';')[0]).join(' | '));
+    ok('下发顺序与调用顺序一致', /echo A/.test(emu.scripts[0].text) && /echo B/.test(emu.scripts[1].text),
+      emu.scripts.map((x) => x.text.trim()).join(' | '));
     emu.destroy();
   }
 
@@ -141,12 +165,37 @@ await (async () => {
 
   // 4. listProjectFiles 也走同一条队列
   {
-    const { vm, emu } = makeVm([0]);
+    const seen = [];
+    const { vm, emu } = makeVm([0], (line) => seen.push(line));
     emu.add_listener('serial0-output-byte', () => {});
     const p = vm.listProjectFiles().catch(() => null);
     const r = await vm.run('x', { timeout: 300 });
-    await p;
+    const files = await p;
     ok('listProjectFiles 与 run 串行', emu.violations === 0, `violations=${emu.violations}`);
+    // 顺带把解析也钉住：du -b 的「<字节数>\t<路径>」要变成 { name, size }，且按名字排序
+    ok(
+      '  解析出「名字 + 大小」并按名字排序',
+      Array.isArray(files) &&
+        files.length === 2 &&
+        files[0].name === 'helloworld.c' &&
+        files[0].size === 6120 &&
+        files[1].name === 'src/mrp_compat.c' &&
+        files[1].size === 1106,
+      JSON.stringify(files)
+    );
+    ok('  文件名前的 ./ 被剥掉', !files.some((f) => f.name.startsWith('./')));
+    // 列目录的输出是数据，不该出现在可见日志里（否则一启动就刷一屏文件名）
+    const log = seen.join('');
+    ok(
+      '  列目录的数据不外泄到可见日志',
+      !log.includes('helloworld.c') && !log.includes('6120'),
+      JSON.stringify(log.slice(0, 120))
+    );
+    ok('  普通输出照旧转发（只静音列目录那一段）', (() => {
+      seen.length = 0;
+      emu.emit('compile: hello.c\r\n');
+      return seen.join('').includes('compile: hello.c');
+    })());
     emu.destroy();
   }
 })();
