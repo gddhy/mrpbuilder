@@ -285,9 +285,29 @@ export class MrpVm {
     this.ready = true;
   }
 
-  /** 内核自带 rootfs 的 shell 没有固定提示符，用探针反复问直到它有回应 */
+  /**
+   * 内核自带 rootfs 的 shell 没有固定提示符，用探针反复问直到它有回应。
+   *
+   * 探针不能一开机就发：busybox init 通过 /etc/inittab 的 `::respawn:-/bin/sh`
+   * 拉起 login shell，login shell 要先 source /etc/profile（输出
+   * "Enable networking…" / "Files send…" 那两行 banner）才进入读命令的状态。
+   * 在 banner 出来之前串口链路还没稳定，此时打进串口的 `echo "__RDY…"` 会丢字节，
+   * shell 收到残缺命令（如 `ho`）就报 `-/bin/sh: ho: not found` ——
+   * 这正是每次启动日志里那句噪音。所以先等 banner：banner 一出现就代表 shell 已就绪，
+   * 这时再发探针就不会丢了。banner 等不到（比如换过内核镜像）就退回探针兜底。
+   */
   async waitForShell(timeoutMs) {
     const deadline = Date.now() + timeoutMs;
+    try {
+      // banner 是 /etc/profile 最后几行的输出，出现即 login shell 已就绪
+      await this.waitFor(
+        /Files send via emulator appear in \/mnt\//,
+        Math.min(timeoutMs, 60_000),
+        'shell banner'
+      );
+    } catch {
+      /* banner 没等到（换过内核？）→ 继续走下面的探针兜底 */
+    }
     while (Date.now() < deadline) {
       const id = `__RDY${Math.random().toString(36).slice(2, 8)}`;
       const a = id.slice(0, 6);
