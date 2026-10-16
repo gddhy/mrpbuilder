@@ -310,6 +310,7 @@ assets/
   ingest.js                 导入路径规则（剥公共顶层目录 / 跳过隐藏项 / .gitignore 匹配）
   codeview.js               C 源码着色 + 行号文本（纯函数，无 DOM 依赖）
   wheel.js                  滚轮决策：滚哪个元素、滚多少（纯函数，无 DOM 依赖）
+  selectall.js              Ctrl+A 全选谁：编辑窗/输入框走原生、弹窗里不动作、其它全选日志区
   serial.js                 串口的收发编解码（UTF-8 字节级）+ 把路径安全拼进 shell 命令
   encoding.js               源码编码识别 + 编解码（UTF-8 / GBK，纯函数；GBK 复用 mrp-pack 的码表）
   theme.js                  浅色/深色主题（跟随浏览器 → 手动选择优先 → 记住上次）
@@ -352,6 +353,7 @@ tools/
   test-v86-mouse.mjs        验证 v86 的鼠标/键盘适配器被关掉（否则启动后输入框点不进去）
   test-codeview.mjs         验证 C 着色（转义 / 往返无损 / 各类 token）+ 与 style.css 的契约
   test-wheel.mjs            验证滚轮决策：普通滚轮纵向、Shift 只横向（滚到尽头就停住不越界）
+  test-selectall.mjs        验证 Ctrl+A 分流：编辑窗/输入框走原生、弹窗里不动作、其它全选日志区
   test-serial.mjs           验证串口 UTF-8 往返 + shell 引号转义（含单引号/反引号/分号）+ 路径白名单
   test-encoding.mjs         验证源码编码识别（UTF-8/GBK，用 Python 算出的已知 GBK 字节做基准）
   test-project-files.mjs    工程文件那块：大小显示、重命名/删除同步、下载按钮文案与包名
@@ -437,6 +439,8 @@ node tools/dev-server.mjs --port 8000
    编辑器右下角的「**全屏**」把它铺满整个网页（只是加个 class，不走 Fullscreen API ——
    那会把浏览器 UI 一起切走、嵌入式宿主里还常被禁用）；再点一次或按 <kbd>Esc</kbd> 退出。
    全屏时顶栏被盖住，但 <kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd> 编译仍然可用。
+   <kbd>Ctrl/Cmd</kbd>+<kbd>A</kbd> 的全选**按焦点分流**：焦点在编辑窗内就全选编辑窗（原生），
+   在别处则全选「编译输出」而不是整个网页，弹窗开着时不动 —— 详见「输出框的复制能力」。
    **读 / 改的状态会在「编译输出」里明说**（`[文件]` 前缀，见「编译输出里那些 `2=$?"` 是
    怎么回事」那节）：`[文件] 读取 xxx（大小）`、`[文件] 已修改 xxx`、
    编译前 `[文件] 同步到虚拟机：N 个改动（…）`。不用盯着编辑器底下那行小字猜。
@@ -501,6 +505,7 @@ node tools/test-ingest.mjs      # 导入路径规则：剥顶层目录 + 隐藏�
 node tools/test-v86-mouse.mjs   # v86 适配器：不关掉的话，启动虚拟机后输入框会点不进去
 node tools/test-codeview.mjs    # 源码着色：HTML 往返无损 + token 类与调色板的契约
 node tools/test-wheel.mjs       # 滚轮决策：Shift 只横向（到头停住）/ 普通滚轮纵向 / 链式滚动
+node tools/test-selectall.mjs  # Ctrl+A：编辑窗/输入框走原生、弹窗里不动作、其它全选日志区
 node tools/test-serial.mjs     # 串口 UTF-8 收发 + 单引号转义（不能出现命令注入）
 node tools/test-encoding.mjs   # 源码编码识别：UTF-8/GBK，GBK 字节与 Python 一致
 node tools/test-project-files.mjs  # 工程文件：大小 / 重命名 / 删除 / 下载按钮文案与包名
@@ -694,7 +699,8 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 | 点「编译」跑完整 `-Os` 构建 | ✅ **编译成功**，与 Node 侧结果一致（**14,664 字节**） |
 | 用引擎归档的两次构建（推归档 → 快路径 / 归档缺失 → 自动重建） | ✅ 3.6s / 196.0s，两次产物都与全量编译**逐字节一致** |
 | 「下载 bin.elf」 | ✅ 按钮变为可用 |
-| 输出框文本选择 | ✅ `user-select: text`（`Ctrl/Cmd+A` 可全选） |
+| 输出框文本选择 | ✅ `user-select: text` + `tabindex="0"`，鼠标拖选可用 |
+| `Ctrl/Cmd+A` 按焦点分流 | ✅ 真浏览器逐场景 10/10：编辑窗 / 输入框走原生、打包与帮助弹窗里不动作、其它全选日志区（**不再全选整页**） |
 | 「复制错误」/「复制日志」 | ✅ 前者只留报错行 + `in function` 上下文，过滤 warning 与普通输出 |
 | **「打包 .mrp」真实鼠标点击** | ✅ 对话框打开 → 填表 → 生成并下载，产物 **216,777 字节**，页面自检通过 |
 | 只上传 `bin.elf` 不编译就打包 | ✅ 按钮自动可用，日志提示"不必重新编译" |
@@ -732,7 +738,12 @@ start.mr  →  bin.elf  →  资源文件  →  cfunction.ext
 
 ### 输出框的复制能力
 
-- 显式 `user-select: text` + `tabindex="0"`，鼠标拖选、`Ctrl/Cmd+A` 全选都可用
+- 显式 `user-select: text` + `tabindex="0"`，鼠标拖选就能选中
+- **`Ctrl/Cmd+A` 按焦点分流**（决策在 `assets/selectall.js`，纯函数、有单测）：
+  焦点在**源码编辑窗 / 任意输入框**（含打包弹窗里的）→ 放行浏览器原生（就全选那个框内的文本）；
+  有弹窗（帮助 / 打包 `.mrp`）打开、焦点不在输入框 → **什么都不做**；
+  其它情况 → **全选这块编译输出区**，而不是像浏览器默认那样全选整个网页
+  （默认行为会把顶栏、文件列表一起选进去）
 - **「复制错误」**：只提取报错行（`undefined reference` / `error:` / `ld:` / `collect2:` /
   `make: ***` / `No such file` / `cannot ...` / `fatal error` / `编译失败`），
   并把紧邻的 ``in function `xxx':`` 上下文行一起带上 —— 直接贴出来就能给别人看

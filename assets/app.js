@@ -12,6 +12,7 @@ import { cacheEntryMatches, readImageCache, writeImageCache } from './imagecache
 import { fmtBytes, fmtDuration } from './bytes.js'; // 体积/耗时文案，与命令行共用同一份
 import { isSafeRelPath } from './serial.js'; // 相对路径白名单（重命名 / 删除前挡一道）
 import { wheelDeltas, planWheel } from './wheel.js'; // 滚轮决策（纯函数，单测覆盖）
+import { planSelectAll } from './selectall.js'; // Ctrl+A 全选谁（纯函数，单测覆盖）
 import { detectEncoding, decodeSource, encodeSource, ENC_UTF8, ENC_GBK } from './encoding.js'; // 源码编码识别（UTF-8 / GBK）
 import {
   highlightC,
@@ -1973,6 +1974,42 @@ window.addEventListener('keydown', (e) => {
   if (el.packOverlay.classList.contains('show')) closePackOverlay();
   else if (el.helpOverlay.classList.contains('show')) closeHelpOverlay();
   else if (el.editorWrap.classList.contains('maxed')) setEditorMaxed(false);
+});
+
+/**
+ * 用选区把某个元素的文本整个选中（Ctrl+A 全选编译输出区用）。
+ * 编译输出区是 `<pre>`，不是表单元素、不能 `select()`，只能用 Range。
+ */
+function selectNodeText(node) {
+  const sel = window.getSelection();
+  if (!sel || !node) return;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/**
+ * Ctrl/Cmd + A 该全选谁：焦点在可编辑文本里（源码编辑窗 / 输入框）→ 交给浏览器原生；
+ * 有弹窗（帮助 / 打包）打开 → 什么都不做；其它情况 → 全选编译输出区，而不是整个网页。
+ * 「怎么分流」的决策在 `assets/selectall.js`（纯函数，单测覆盖），这里只做 DOM 那半。
+ *
+ * 顺带：`#console` 带 `tabindex="0"`，所以点了日志区之后焦点就在它上面，
+ * 这条路同样命中 `'console'` → 全选日志，符合直觉。
+ */
+window.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+  if (String(e.key).toLowerCase() !== 'a') return;
+  const active = document.activeElement;
+  const plan = planSelectAll(
+    active
+      ? { tagName: active.tagName, type: active.type, isContentEditable: active.isContentEditable }
+      : null,
+    !!document.querySelector('.overlay.show')
+  );
+  if (plan === 'native') return; // 编辑窗 / 输入框：让浏览器原生全选
+  e.preventDefault();
+  if (plan === 'console') selectNodeText(el.console);
 });
 
 el.btnCopyLog.onclick = () => {
