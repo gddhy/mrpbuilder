@@ -19,6 +19,8 @@
     "gcc-12-base": "12.2.0-14+deb12u1"
   },
   "kernel": "buildroot-bzimage68.bin",
+  "kernel_bytes": 10068480,
+  "kernel_sha256": "507a759c70ab7a490a233be454d0b5b88bc667956a410b531cb4edc091e2eb1c",
   "rootfs_bytes": 105823127,
   "rootfs_tar_bytes": 32134639,
   "rootfs_tar_sha256": "55268c1862afece6da44eb38774f84c73352788f611935e456838775e3f93c28",

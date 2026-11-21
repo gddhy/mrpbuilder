@@ -214,6 +214,108 @@ node tools/make-engine-lib.mjs   # 改过 src/ 下的 .c/.h 就重跑：重生�
 顺带把「镜像是否就位」的探测挪到了启动虚拟机之前，并且本地缓存命中时跳过
 那几次 HEAD 探测 —— 所以镜像在本地时，断网也能开工。
 
+### 启动顺序：先问线上，再决定用不用本地
+
+光有缓存还不够 —— 工具链换过之后必须**立刻发现**，别拿旧的在本地跑。所以每次
+启动第一步是 `assets/imagecache.js` 的 `resolveImagePlan()`：拿线上
+`rootfs.parts.json` / `image.json`（都是 `no-store` 现取）与本地缓存记录的 sha256
+对账，结果只有三种：
+
+| 情况 | 行为 | 日志 |
+|---|---|---|
+| 线上与本地一致 | 用本地缓存，不下载 | `✓ 线上与本地缓存一致（55268c18…）→ 不重复下载` |
+| 线上变了（工具链换过） | **弃用本地缓存 + 作废启动快照**，重新线上获取 | `⚠ 线上已更新（工具链镜像）→ 弃用本地缓存与启动快照，改从线上重新获取` |
+| 线上清单拿不到（离线 / `file://`） | 只能用本地缓存，并说明"无法确认线上版本" | `⚠ 拿不到线上清单（离线 / file://）→ 只能用本地缓存` |
+
+注意第三条里 `resolveImagePlan()` 会把「实际使用的摘要」**回落到本地缓存记录**上。
+这一步不是可有可无的：启动快照的 key 就是拿它算的，若离线时给空值，key 变成
+`no-sha`，本地明明有快照也永远不命中 —— 等于把「离线可用」自己废掉。
+
+「首次使用」不算更新（本地没有缓存摘要时 `updated` 为 false），否则第一次打开会
+打出「已更新」的误导文案。
+
+### 启动快照：第二次打开只要 4 秒
+
+冷启动的两段等待都没有信息量：v86 引导 Linux 8 秒，再把 31 MiB 工具链推进去
+解压、建软链、配环境 21.7 秒 —— 合计 33 秒，而结果每次完全一样。
+
+v86 支持 `save_state()` 与构造参数 `initial_state`（在 `init()` 之后、`run()`
+之前灌回去）：把「CPU + 内存 + 设备」整块存成一个 ArrayBuffer。所以在 boot
+结束时存一份，之后打开直接恢复。
+
+| | 冷启动 | 从快照恢复 |
+|---|---|---|
+| 引导内核 + 安装工具链 | 33.2 s | 0 |
+| `restore_state` + shell 探针 | — | **4.0 s** |
+| 首次保存：save_state / gzip | — | 0.6 s / 5.9 s（一次性） |
+| 快照体积 | — | 182.4 MB → 压缩后 **83.0 MB** |
+
+恢复后编译的产物与冷启动**逐字节一致**（同一个探针，sha256 `dc2e28f0…`）。
+
+> 以上是 `tools/test-snapshot-vm.mjs` 在 Node 里的实测（同一份 `vm.js`、同一个 `v86.wasm`）。
+> 浏览器侧单独验过存储层：IndexedDB 写 83 MB 用 **256 ms**、读回 **173 ms**、尾部字节完整。
+> 完整的「点按钮 → 存快照 → 刷新 → 恢复」还没在真实浏览器里跑通 —— 本机后台标签被
+> Chromium 节流（v86 的 tick 被压到 ~1 次/秒，180 秒都没引导完，与本次改动无关）。
+> 前台标签下按原来「20 秒到就绪」的量级推算，恢复应落在 5~6 秒（多一次解压）。
+
+三个必须讲清的前提：
+
+1. **只存初始状态**。存快照的位置固定在 `boot()` 末尾 —— 工具链刚装好、工程
+   还是内置模板那一刻。用户改过工程之后绝不覆盖：现在刷新页面就是回到模板，
+   快照若存了「改到一半」的样子，刷新行为就变了。
+2. **与镜像强绑定**。key = 快照格式版本 + `image.json` 的 `built` + rootfs 的
+   sha256 + 内核的 sha256 + 内存大小（`snapshotKeyOf()`）。任一项变了旧快照
+   自动作废并删除 —— 尤其 rootfs：快照里的 `/opt/tc` 是上一版工具链。跟引擎
+   归档一样，用内容摘要而不是时间戳。这里的摘要来自 `resolveImagePlan()`
+   （线上优先、离线回落本地缓存），所以断网时快照仍然可用，而线上换了工具链时
+   快照会立刻失效。
+3. **9p 不随快照走**。`filesystem: {}` 建出来的宿主侧 inode 表是 JS 对象，不进
+   guest 内存；带着已挂载的 `/mnt` 存快照，恢复后 guest 会拿着旧 fid 去查一张
+   空表，`/mnt` 直接坏掉（之后所有 `putFile` 都失败）。所以
+   `captureSnapshot()` 的顺序是：读 `/proc/mounts` 记下挂载参数 →
+   `umount /mnt` → `save_state()` → **立刻挂回去**；恢复后再挂一次。
+
+   两个实测踩到的细节：
+   - `/proc/mounts` 是**空格分隔**（`host9p /mnt 9p rw,...,trans=virtio 0 0`），
+     里面没有 `" on /mnt "` —— 拿 `mount`(8) 的排版去 grep 会永远不命中，于是
+     「卸载成功」被无条件判真，存出来一份带挂载的坏快照。`test-snapshot.mjs`
+     钉住了这两种格式。
+   - 真实 tag 是 **`host9p`**（不是别处常见的 `hostshare`），重挂必须用解析出来
+     的 device，不能写死；选项也只留 `trans` / `version` / `access`，照抄
+     `rw,relatime` 没意义。
+
+4. **v86 对"装载失败"是静默的**。它内部是
+   `function Da(a){ if (a.buffer instanceof ArrayBuffer) return new z(a.buffer); … }` ——
+   只认 `ArrayBuffer`。传 `{ buffer: Uint8Array }` 时三个分支（ArrayBuffer / File / url）
+   **全不命中，函数返回 undefined**：内核根本不加载，CPU 不启动，串口一个字节都没有，
+   界面就停在「—— 启动虚拟机 ——」不动，而且**不报错**，极难查（踩过一次：
+   把 `kernel: {url}` 改成 `{buffer: Uint8Array}` 之后整台虚拟机"卡住"）。
+   现在 `assets/vm.js` 的 `kernelOption()` 会统一规范化成 ArrayBuffer，`boot()` 里
+   还在装载前做一次早期校验，`test-snapshot.mjs` 钉住了这几种形态。
+
+失败一律降级成冷启动，不影响功能：
+
+- 拿不到 `indexedDB`（`file://` / 隐私模式）→ 读不到也写不进；
+- 没有 `CompressionStream`（老浏览器）→ 不保存（83 MB 是压缩后的，182 MB 原始
+  字节写进 IndexedDB 只会吃光配额）；
+- 配额不足 / 写入被拒 → 只提示一句；
+- 解压失败、`rawSize` 对不上（存档被截断）、恢复后 9p 挂不上 → **删掉快照并自动
+  改走正常启动**（`boot({ retry: true })`），用户点一次按钮就能用。
+
+快照丢失之后的取用顺序是：本地缓存的**内核**（IndexedDB，按 `kernel_sha256`
+校验）+ 本地缓存的 **rootfs**（`imagecache.js`，按 parts.json 的 sha256 校验）→
+都丢了才联网。恢复路径上 rootfs 那 31 MiB 其实用不上（工具链已经在快照的内存
+里了），只有内核还得喂给 init，所以内核也单独缓存了一份。
+
+维护提示：
+
+- 改了 `captureSnapshot()` 的步骤（多存了东西 / v86 升级导致 state 格式不兼容）
+  → 把 `assets/snapshot.js` 的 `SNAPSHOT_VERSION` +1，旧快照自动作废；
+- 改了 `VM_MEMORY` → key 自动变（`restore_state` 要求内存大小一致，否则直接崩）；
+- 从快照恢复**不会**跑 `installToolchain`，所以 PATH / LD_LIBRARY_PATH /
+  COMPILER_PATH / CPATH 得靠 `MrpVm.applyToolchainEnv()` 重新装配 —— 漏了的表现
+  是 `cannot execute 'cc1'`（新实例的 `env` 是空的）。
+
 ### 试过但没用的手段（都实测过）
 
 | 手段 | 实测 | 结论 |
@@ -306,7 +408,8 @@ assets/
   vm.js                     MrpVm —— 虚拟机驱动（浏览器 / Node 共用，无 DOM 依赖）
   mrp-pack.js               MRP 容器打包器（浏览器 / Node 共用，无依赖，含 GBK 编解码）
   bytes.js                  gzip / tar 格式判定与压缩（打包器和镜像安装共用）
-  imagecache.js             工具链镜像的本地缓存（IndexedDB；按清单 sha256 判断线上有没有变）
+  imagecache.js             工具链镜像 + 内核的本地缓存（IndexedDB；按清单 sha256 判断线上有没有变）
+  snapshot.js               启动快照的本地存储（IndexedDB + gzip；按镜像/内核摘要失效，见「启动快照」）
   ingest.js                 导入路径规则（剥公共顶层目录 / 跳过隐藏项 / .gitignore 匹配）
   codeview.js               C 源码着色 + 行号文本（纯函数，无 DOM 依赖）
   wheel.js                  滚轮决策：滚哪个元素、滚多少（纯函数，无 DOM 依赖）
@@ -323,7 +426,7 @@ assets/
     rootfs.tar.gz           工具链（31 MiB 压缩 / 101 MiB 解开）
     rootfs.tar.gz.part*     按 20 MiB 切的分段（Cloudflare Pages / EdgeOne 的 25MB 限制）
     rootfs.parts.json       分段清单（大小 + sha256，浏览器按它拼合校验）
-    image.json              构建元信息（含 sha256，可用于校验）
+    image.json              构建元信息（rootfs / 内核的 sha256，用于缓存与快照失效判定）
 mrp_demo/                   MRP 工程模板（「下载demo」直接从虚拟机里这份现取打包，
                             仓库里不再有静态的 mrp_demo.zip —— 见「下载 demo」）
   Makefile                 按社区方案编写（含引擎预编译归档逻辑，见「编译速度」）
@@ -349,6 +452,7 @@ tools/
   test-errors.mjs           验证「复制错误」的报错行提取
   test-theme.mjs            验证主题判定规则 + 两套调色板一致（含"没有字面颜色"守卫）
   test-imagecache.mjs       验证工具链镜像的本地缓存判定 + 无 indexedDB 时优雅退化
+  test-snapshot.mjs         验证启动快照：内容指纹 / 启动前版本对账 / gzip 往返 / 无存储降级 / 9p 挂载参数解析
   test-ingest.mjs           验证导入路径规则 + .gitignore 解析与匹配（正反两面）
   test-v86-mouse.mjs        验证 v86 的鼠标/键盘适配器被关掉（否则启动后输入框点不进去）
   test-codeview.mjs         验证 C 着色（转义 / 往返无损 / 各类 token）+ 与 style.css 的契约

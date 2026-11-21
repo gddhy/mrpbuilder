@@ -8,7 +8,23 @@
 
 import { MrpVm } from './vm.js';
 import { unzip, zipDeflate } from './zip.js';
-import { cacheEntryMatches, readImageCache, writeImageCache } from './imagecache.js';
+import {
+  cacheEntryMatches,
+  readImageCache,
+  writeImageCache,
+  readKernelCache,
+  writeKernelCache,
+  kernelCacheMatches,
+  resolveImagePlan,
+} from './imagecache.js';
+import {
+  snapshotKeyOf,
+  readSnapshot,
+  writeSnapshot,
+  clearSnapshot,
+  compressSnapshot,
+  decompressSnapshot,
+} from './snapshot.js';
 import { fmtBytes, fmtDuration } from './bytes.js'; // 体积/耗时文案，与命令行共用同一份
 import { isSafeRelPath } from './serial.js'; // 相对路径白名单（重命名 / 删除前挡一道）
 import { wheelDeltas, planWheel } from './wheel.js'; // 滚轮决策（纯函数，单测覆盖）
@@ -47,6 +63,12 @@ const URLS = {
   kernel: new URL('image/vmlinuz.bin', ASSETS).href,
   rootfs: new URL('image/rootfs.tar.gz', ASSETS).href,
 };
+
+/**
+ * 虚拟机内存。启动快照的 key 里也带着它 —— v86 的 restore_state 要求内存大小
+ * 与存档时一致，改了这里旧快照就必须作废（snapshotKeyOf 会算进去）。
+ */
+const VM_MEMORY = 384 * 1024 * 1024;
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -892,6 +914,96 @@ async function loadManifest() {
   return manifestCache;
 }
 
+/**
+ * 镜像构建元信息（image/image.json）：镜像 built 时间、内核的字节数与 sha256。
+ * 启动快照的 key 要用它 —— rootfs 的 sha256 在 parts.json 里，内核的在这里。
+ * 只有几百字节，no-store，永远拿最新。
+ */
+let imageMetaCache;
+async function loadImageMeta() {
+  if (imageMetaCache !== undefined) return imageMetaCache;
+  try {
+    const r = await fetch(new URL('image/image.json', ASSETS), { cache: 'no-store' });
+    imageMetaCache = r.ok ? await r.json() : null;
+  } catch {
+    imageMetaCache = null;
+  }
+  return imageMetaCache;
+}
+
+/**
+ * 内核字节（10 MiB），优先用 IndexedDB 里那份。
+ *
+ * 从快照恢复时 rootfs 那 31 MiB 完全用不上（工具链早就在快照的内存里了），
+ * 只剩内核还得喂给 v86 的 init。把内核也缓存住，「快照 + 内核」这条路就完全不联网。
+ * 校验用 image.json 的 kernel_sha256 / kernel_bytes；老部署没有这两个字段时直接下载 ——
+ * 判不了新旧就不复用，和 rootfs 缓存同一个取向。
+ */
+let kernelBytesCache;
+async function loadKernel() {
+  if (kernelBytesCache) return kernelBytesCache;
+  const meta = await loadImageMeta();
+  const want = { sha256: meta?.kernel_sha256, size: meta?.kernel_bytes };
+  const judgeable = !!(want.sha256 && want.size);
+
+  if (judgeable) {
+    const entry = await readKernelCache();
+    if (kernelCacheMatches(entry, want)) {
+      const hex = await sha256Hex(entry.bytes);
+      if (!hex || hex === want.sha256) {
+        writeLine(`  内核：本地缓存 ${fmtBytes(entry.size)}（不再联网）`);
+        kernelBytesCache = entry.bytes;
+        return kernelBytesCache;
+      }
+    }
+  } else {
+    /*
+     * 线上元信息不可用（离线 / 老部署还没有 kernel_* 字段）。这时仍然优先用本地缓存：
+     * 快照恢复必须有内核喂给 init，没有它「离线可用」就缺最后一环。
+     * 判不了新旧，但本地缓存与快照是同一批生成的，至少彼此自洽。
+     */
+    const entry = await readKernelCache();
+    if (entry?.bytes?.length) {
+      writeLine(`  内核：线上元信息不可用 → 用本地缓存 ${fmtBytes(entry.size)}`);
+      kernelBytesCache = entry.bytes;
+      return kernelBytesCache;
+    }
+  }
+
+  const r = await fetch(URLS.kernel, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`内核下载失败（HTTP ${r.status}）`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  kernelBytesCache = bytes;
+  writeLine(`  内核：${fmtBytes(bytes.length)}`);
+  if (judgeable && bytes.length === want.size) {
+    const hex = await sha256Hex(bytes);
+    if (!hex || hex === want.sha256) await writeKernelCache(bytes, want);
+  }
+  return kernelBytesCache;
+}
+
+/**
+ * 启动前的「版本对账」：**先问线上，再决定用不用本地**。
+ *
+ *   · 线上与本地一致 → 用本地缓存（不下载），快照照常可用；
+ *   · 线上跟本地不一样（工具链换过）→ 弃用本地缓存、重新线上获取，并把快照作废
+ *     （旧快照里的 /opt/tc 是上一版工具链，拿它编出来的东西不可信）；
+ *   · 线上拿不到（离线 / file://）→ 只能用本地缓存；这时快照尤其重要，它是唯一
+ *     还能几秒启动的路。
+ *
+ * 返回值里的 rootfsSha / kernelSha 是**本次实际使用**的那份镜像的摘要。
+ * 启动快照的 key 必须用它算：直接拿 manifest 算的话，离线时 manifest 是 null，
+ * key 会退化成 no-sha，本地明明有快照也永远不命中。
+ */
+async function resolveImageSource() {
+  const manifest = await loadManifest();
+  const meta = await loadImageMeta();
+  const cachedRootfs = await getCachedRootfs();
+  const cachedKernel = await readKernelCache();
+  const plan = resolveImagePlan({ manifest, meta, cachedRootfs, cachedKernel });
+  return { ...plan, manifest, meta };
+}
+
 /** 本地缓存条目（读一次就记住，避免 30MB 从 IndexedDB 反序列化两遍） */
 async function getCachedRootfs() {
   if (rootfsCacheEntry === undefined) rootfsCacheEntry = await readImageCache();
@@ -1003,8 +1115,19 @@ async function loadRootfs() {
   const manifest = await loadManifest();
 
   if (!manifest?.parts?.length) {
-    // 没有清单（单文件部署 / file://）：判断不了"线上有没有变"，所以不复用缓存，
-    // 老老实实下整包。这里不做缓存是刻意的 —— 宁可贵一点，也不要用到错版本工具链。
+    /*
+     * 没有清单（单文件部署 / file:// / 离线）。
+     *
+     * 以前这里一律不复用缓存 —— 判不了"线上有没有变"，宁可贵一点也不用错版本。
+     * 但那样离线就彻底启动不了，而离线正是本地缓存存在的意义。现在改成：
+     * 有清单才谈得上"确认版本"；没清单时用缓存，并在日志里说清"无法确认线上版本"。
+     * 是否该作废快照由 resolveImagePlan 判（它只有在拿得到清单时才判 updated）。
+     */
+    const cached = await getCachedRootfs();
+    if (cached?.bytes?.length) {
+      writeLine('  没有分段清单（离线？）→ 用本地缓存的整包镜像（无法确认线上版本）');
+      return cached.bytes instanceof Uint8Array ? cached.bytes : new Uint8Array(cached.bytes);
+    }
     const r = await fetch(URLS.rootfs, { cache: 'no-store' });
     if (!r.ok) throw new Error(`工具链下载失败（HTTP ${r.status}）`);
     const bytes = new Uint8Array(await r.arrayBuffer());
@@ -1072,30 +1195,104 @@ async function loadRootfs() {
   return all;
 }
 
-async function boot() {
+async function boot({ retry = false } = {}) {
   if (state.phase === 'boot' || state.phase === 'ready') return;
   setPhase('boot', '正在启动 …');
   setBusy(true);
-  clearConsole();
-  writeLine('正在加载内核与工具链（首次约 1~3 分钟，取决于机器性能和网络）…');
+  if (retry) {
+    writeLine('\n—— 改走正常启动 ——');
+  } else {
+    clearConsole();
+    writeLine('正在准备编译环境（首次约 1~3 分钟，之后打开会从本地快照恢复，只要几秒）…');
+  }
 
+  // ---- 0. 先问线上：工具链有没有更新（有更新就弃用本地缓存与快照）----
+  writeLine('\n检查线上工具链版本 …');
+  const img = await resolveImageSource();
+  const manifest = img.manifest;
+  const meta = img.meta;
+
+  if (img.updated) {
+    const what = [img.rootfsUpdated && '工具链镜像', img.kernelUpdated && '内核']
+      .filter(Boolean)
+      .join(' + ');
+    writeLine(`  ⚠ 线上已更新（${what}）→ 弃用本地缓存与启动快照，改从线上重新获取`);
+    await clearSnapshot();
+  } else if (!img.online) {
+    writeLine(
+      img.hasCache
+        ? '  ⚠ 拿不到线上清单（离线 / file://）→ 只能用本地缓存（无法确认线上版本）'
+        : '  ⚠ 拿不到线上清单（离线 / file://），本地也没有缓存'
+    );
+  } else if (img.hasCache) {
+    writeLine(`  ✓ 线上与本地缓存一致（${(img.rootfsSha || '').slice(0, 12)}…）→ 不重复下载`);
+  } else {
+    writeLine('  首次使用 → 从线上下载（会存到本地，之后不再下）');
+  }
+
+  /*
+   * 启动快照的 key：镜像 built + **实际会用到**的 rootfs / 内核摘要 + 内存大小。
+   * 这里必须用 img 里那份（线上优先、离线回落本地缓存），不能直接用 manifest ——
+   * 离线时 manifest 是 null，key 会变成 no-sha，本地明明有快照却永远不命中。
+   */
+  const snapKey = snapshotKeyOf({
+    imageBuilt: img.built,
+    rootfsSha: img.rootfsSha,
+    kernelSha: img.kernelSha,
+    memorySize: VM_MEMORY,
+  });
+
+  // ---- 1. 先看本地有没有可用的启动快照 ----
+  writeLine('\n检查本地启动快照 …');
+  let snap = null;
+  let snapState = null;
   try {
-    // 先确认镜像能拿到，避免白等。
-    // 工具链优先按分段清单校验（EdgeOne/CF Pages 等 25MB 限制的静态托管上
-    // 完整 rootfs.tar.gz 根本不存在，HEAD 它必然 404）：有清单就逐段 HEAD，
-    // 完全不碰完整镜像；没有清单才回退检查单文件。
-    //
-    // 但**本地缓存命中时跳过这些探测** —— 那意味着不必联网也能开工（离线可用），
-    // 也省掉 3 次 HEAD 往返。
-    const manifest = await loadManifest();
-    const cachedEntry = await getCachedRootfs();
-    if (!cacheEntryMatches(cachedEntry, manifest)) {
-      const rootfsChecks = manifest?.parts?.length
-        ? manifest.parts.map((p) => [`工具链分段 ${p.name}`, new URL(`image/${p.name}`, ASSETS).href])
-        : [['工具链', URLS.rootfs]];
-      for (const [label, url] of [['内核', URLS.kernel], ...rootfsChecks]) {
-        const r = await fetch(url, { method: 'HEAD' });
-        if (!r.ok) throw new Error(`${label}缺失（HTTP ${r.status}）`);
+    snap = await readSnapshot(snapKey);
+  } catch {
+    snap = null;
+  }
+  if (snap) {
+    const t = Date.now();
+    snapState = await decompressSnapshot(snap.bytes, {
+      compressed: snap.compressed,
+      rawSize: snap.rawSize,
+    });
+    if (!snapState) {
+      writeLine('  ⚠ 快照解压失败（内容损坏 / 浏览器不支持解压）→ 丢弃，改走正常启动');
+      await clearSnapshot();
+      snap = null;
+    } else {
+      const savedAt = snap.savedAt ? new Date(snap.savedAt).toLocaleString() : '未知时间';
+      writeLine(
+        `  ✓ 命中快照 ${fmtBytes(snap.bytes.length)}（压缩后，存于 ${savedAt}）` +
+          `，解压 ${((Date.now() - t) / 1000).toFixed(1)} 秒 → 跳过引导内核与安装工具链`
+      );
+    }
+  } else {
+    writeLine('  没有可用快照 → 正常启动（只有第一次会慢）');
+  }
+
+  // ---- 2. 确认要用的文件拿得到（快照命中时只需要内核）----
+  try {
+    if (!snap) {
+      // 工具链优先按分段清单校验（EdgeOne/CF Pages 等 25MB 限制的静态托管上
+      // 完整 rootfs.tar.gz 根本不存在，HEAD 它必然 404）：有清单就逐段 HEAD，
+      // 完全不碰完整镜像；没有清单才回退检查单文件。
+      //
+      // 但**本地缓存可用时跳过这些探测** —— 那意味着不必联网也能开工（离线可用），
+      // 也省掉 3 次 HEAD 往返。离线且本地有缓存时同样跳过（否则探测必然失败）。
+      const cachedEntry = await getCachedRootfs();
+      const freshCache =
+        !img.updated &&
+        (cacheEntryMatches(cachedEntry, manifest) || (!img.online && !!cachedEntry?.bytes?.length));
+      if (!freshCache) {
+        const rootfsChecks = manifest?.parts?.length
+          ? manifest.parts.map((p) => [`工具链分段 ${p.name}`, new URL(`image/${p.name}`, ASSETS).href])
+          : [['工具链', URLS.rootfs]];
+        for (const [label, url] of [['内核', URLS.kernel], ...rootfsChecks]) {
+          const r = await fetch(url, { method: 'HEAD' });
+          if (!r.ok) throw new Error(`${label}缺失（HTTP ${r.status}）`);
+        }
       }
     }
   } catch (e) {
@@ -1108,36 +1305,83 @@ async function boot() {
     return;
   }
 
+  // 内核：恢复路径上唯一还需要的外部文件，优先走本地缓存（离线也能恢复）
+  let kernelBytes = null;
+  try {
+    kernelBytes = await loadKernel();
+  } catch (e) {
+    setPhase('err', '内核缺失');
+    writeLine(`\n✗ ${e.message}`);
+    writeLine('\n还没有生成虚拟机镜像，或者网络拿不到它。请在项目根目录运行：');
+    writeLine('    python tools/make-image.py');
+    setBusy(false);
+    return;
+  }
+
+  /*
+   * v86 的 initial_state 要 ArrayBuffer（内部是 `e.initial_state = r.buffer`）。
+   * 解压出来一定是 offset=0 的整块，直接用；万一不是，才复制一次。
+   */
+  const initialSnapshot = !snapState
+    ? null
+    : snapState.byteOffset === 0 && snapState.byteLength === snapState.buffer.byteLength
+      ? snapState.buffer
+      : snapState.slice().buffer;
+
   const vm = new MrpVm({
     wasmPath: URLS.wasm,
     bios: { url: URLS.seabios },
     vgaBios: { url: URLS.vgabios },
-    kernel: { url: URLS.kernel },
-    memorySize: 384 * 1024 * 1024,
+    kernel: { buffer: kernelBytes },
+    memorySize: VM_MEMORY,
     onOutput: pushOutput,
     onStatus: (s) => writeLine(`\n—— ${s} ——`),
   });
   state.vm = vm;
 
+  let retryCold = false;
+  /*
+   * 只有「恢复阶段」的失败才该怪快照（删掉它、改走冷启动）。
+   * 恢复成功之后（读模板、列文件…）再出错是别的原因，不能顺手把一份好快照删了。
+   */
+  let restoring = !!snap;
   try {
-    await vm.boot();
-    writeLine('\n✓ 虚拟机已启动');
+    const tBoot = Date.now();
+    await vm.boot({ initialSnapshot });
+    snapState = null; // 状态已进 v86 的内存，别让这份 384MB 一直挂着
+    writeLine(`\n✓ 虚拟机已就绪（${((Date.now() - tBoot) / 1000).toFixed(1)} 秒）`);
 
-    if (!rootfsCache) {
-      writeLine('正在准备工具链镜像 …');
-      rootfsCache = await loadRootfs();
-      writeLine(`  镜像就绪：${fmtBytes(rootfsCache.length)}`);
-    }
+    if (snap) {
+      /*
+       * 快照里 /mnt 是**卸载**状态：宿主侧的 9p inode 表是 JS 对象，不随快照走，
+       * 带着已挂载的 /mnt 存快照，恢复后 guest 会拿着旧 fid 查一张空表。
+       * 所以这里必须重新挂一次（参数是存快照时记下来的）。
+       */
+      if (!snap.share) throw new Error('快照里没有共享目录的挂载参数');
+      await vm.mountShare(snap.share);
+      writeLine('  ✓ 共享目录已重新挂载');
+      restoring = false;
+    } else {
+      if (!rootfsCache) {
+        writeLine('正在准备工具链镜像 …');
+        rootfsCache = await loadRootfs();
+        writeLine(`  镜像就绪：${fmtBytes(rootfsCache.length)}`);
+      }
 
-    const info = await vm.installToolchain(rootfsCache);
-    if (info?.regzipped) {
-      // 常见于服务端给 .tar.gz 响应加了 Content-Encoding: gzip，浏览器会自动解码，
-      // 结果拿到的是未压缩的 tar。installToolchain 已就地压回去，这里只做提示。
-      writeLine(
-        `  ⚠ 下载到的镜像不是 gzip（被传输层透明解压过），已重新压缩为 ${fmtBytes(info.bytes)}`
-      );
+      const info = await vm.installToolchain(rootfsCache);
+      if (info?.regzipped) {
+        // 常见于服务端给 .tar.gz 响应加了 Content-Encoding: gzip，浏览器会自动解码，
+        // 结果拿到的是未压缩的 tar。installToolchain 已就地压回去，这里只做提示。
+        writeLine(
+          `  ⚠ 下载到的镜像不是 gzip（被传输层透明解压过），已重新压缩为 ${fmtBytes(info.bytes)}`
+        );
+      }
+      writeLine('\n✓ 工具链已装入虚拟机');
+
+      // 唯一的「干净初始状态」就在这一刻：工具链好了、工程还是内置模板。
+      // 用户改过工程之后绝不能覆盖它（否则刷新页面会回到改到一半的样子）。
+      await saveInitialSnapshot(vm, snapKey);
     }
-    writeLine('\n✓ 工具链已装入虚拟机');
 
     // 引擎预编译归档不当"用户文件"看：二进制、体积大、不需要进编辑器
     await refreshProjectIndex();
@@ -1160,12 +1404,71 @@ async function boot() {
     setPhase('ready', '环境就绪');
     writeLine(`✓ 内置工程模板 ${state.template.length} 个文件，可以开始编译了`);
   } catch (e) {
-    setPhase('err', '启动失败');
-    writeLine(`\n✗ ${e.message}`);
+    if (snap && restoring) {
+      /*
+       * 快照坏了（换了浏览器版本 / 存档被截断 / 9p 挂不上）不能让用户卡死在这里：
+       * 删掉它、自动改走正常启动。下次打开会重新存一份新的。
+       */
+      await clearSnapshot();
+      writeLine(`\n⚠ 快照恢复失败：${e.message}`);
+      writeLine('  已删除这份快照，自动改走正常启动 …');
+      try {
+        await vm.stop();
+      } catch {}
+      state.vm = null;
+      retryCold = true;
+    } else {
+      setPhase('err', '启动失败');
+      writeLine(`\n✗ ${e.message}`);
+    }
   } finally {
-    setBusy(false);
-    el.phase.textContent = '—';
+    if (!retryCold) {
+      setBusy(false);
+      el.phase.textContent = '—';
+    }
   }
+
+  if (retryCold) {
+    setPhase('off', '环境未启动');
+    setBusy(false);
+    return boot({ retry: true });
+  }
+}
+
+/**
+ * 把「工具链装好、shell 等命令」这一刻存成快照（见 assets/snapshot.js 与
+ * vm.captureSnapshot）。失败一律只提示、不抛 —— 存不下最多下次再冷启动一次。
+ */
+async function saveInitialSnapshot(vm, key) {
+  writeLine('\n正在保存启动快照（只此一次，之后打开直接恢复）…');
+  const t = Date.now();
+  let cap;
+  try {
+    cap = await vm.captureSnapshot();
+  } catch (e) {
+    writeLine(`  ⚠ ${e.message} —— 下次仍会正常启动`);
+    return;
+  }
+
+  const raw = cap.state.byteLength;
+  const { bytes, compressed } = await compressSnapshot(cap.state);
+  if (!compressed) {
+    writeLine(`  ⚠ 这个浏览器不支持压缩快照（原始 ${fmtBytes(raw)}）→ 不保存，下次仍会正常启动`);
+    return;
+  }
+
+  const ok = await writeSnapshot(key, {
+    bytes,
+    compressed,
+    rawSize: raw,
+    share: cap.share,
+  });
+  const secs = ((Date.now() - t) / 1000).toFixed(1);
+  writeLine(
+    ok
+      ? `  ✓ 快照已保存：${fmtBytes(bytes.length)}（原始 ${fmtBytes(raw)}，用时 ${secs} 秒）`
+      : '  ⚠ 快照写入失败（配额不足 / 隐私模式）→ 下次仍会正常启动'
+  );
 }
 
 // ---------------------------------------------------------------------------

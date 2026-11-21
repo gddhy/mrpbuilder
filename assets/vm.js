@@ -61,6 +61,98 @@ const SENTINEL_RE = /__(?:RC|LS|RDY)[0-9a-z]{1,16}/;
 const LS_BEGIN_RE = /__LS[0-9a-z]{1,16}_B/;
 const LS_END_RE = /__LS[0-9a-z]{1,16}_E/;
 
+/** 6 位随机串（拼哨兵用） */
+function randomToken() {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+/** 把 Uint8Array / ArrayBuffer 统一成「正好覆盖整块」的 ArrayBuffer */
+function asArrayBuffer(v) {
+  if (v instanceof ArrayBuffer) return v;
+  if (ArrayBuffer.isView(v)) {
+    return v.byteOffset === 0 && v.byteLength === v.buffer.byteLength
+      ? v.buffer
+      : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+  }
+  return null;
+}
+
+/**
+ * v86 的 `Da()` 只认 `a.buffer instanceof ArrayBuffer`：
+ *
+ *   function Da(a){ if (a.buffer instanceof ArrayBuffer) return new z(a.buffer); … }
+ *
+ * 传 `{ buffer: Uint8Array }` 时三个分支（ArrayBuffer / File / url）**全不命中**，
+ * 函数返回 undefined —— 内核静默不加载，CPU 永远不启动，表现就是日志停在
+ * 「—— 启动虚拟机 ——」不动、串口一个字节都没有（这个坑真的踩过，而且
+ * "没有报错"让它特别难查）。所以这里统一规范成 ArrayBuffer。
+ */
+export function kernelOption(k) {
+  if (!k) return k;
+  const direct = asArrayBuffer(k);
+  if (direct) return { buffer: direct };
+  // { buffer: <Uint8Array|ArrayBuffer> } 形态
+  if (k.buffer) {
+    const inner = asArrayBuffer(k.buffer);
+    if (inner) return { buffer: inner };
+  }
+  return k; // { url } 之类交给 v86 自己处理
+}
+
+/**
+ * 解析挂载点那一行，得到「恢复快照后重新挂载」需要的参数。
+ *
+ * 两种输入都得认（实测两种格式不一样，踩过）：
+ *   mount(8)  : `host9p on /mnt type 9p (rw,relatime,access=client,trans=virtio)`
+ *   /proc/mounts: `host9p /mnt 9p rw,relatime,access=client,trans=virtio 0 0`
+ *
+ * 只保留 trans / version / access 三个：重新 mount 需要的就这些，
+ * rw/relatime 由内核按默认给，照抄反而可能带进不认识的标志。
+ * 认不出 trans 就返回 null —— 那说明 /mnt 不是 virtio-9p，不能拿它冒险去挂。
+ *
+ * 纯函数（单测盯这里）：判错的表现是恢复后 /mnt 挂不上，编译时写文件全失败。
+ */
+export function parseShareMount(text, mountPoint = SHARE) {
+  const line = String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => {
+      if (!l) return false;
+      if (l.includes(` on ${mountPoint} `)) return true; // mount(8)
+      return l.split(/\s+/)[1] === mountPoint; // /proc/mounts
+    });
+  if (!line) return null;
+
+  let device = '';
+  let type = '';
+  let rawOpts = '';
+  const pretty = /^(.+?) on (\S+) type (\S+) \(([^)]*)\)/.exec(line);
+  if (pretty) {
+    device = pretty[1];
+    type = pretty[3];
+    rawOpts = pretty[4];
+  } else {
+    const f = line.split(/\s+/);
+    if (f.length < 4) return null;
+    device = f[0];
+    type = f[2];
+    rawOpts = f[3];
+  }
+
+  const pick = (name) => {
+    const r = new RegExp(`(?:^|,)${name}=([^,]+)`).exec(rawOpts);
+    return r ? r[1].trim() : '';
+  };
+  const trans = pick('trans');
+  if (!trans) return null;
+  const options = ['trans', 'version', 'access']
+    .map((k) => [k, pick(k)])
+    .filter(([, v]) => v)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',');
+  return { device: device.trim(), type: type.trim(), options };
+}
+
 
 export class MrpVm {
   /**
@@ -246,16 +338,48 @@ export class MrpVm {
   }
 
   // ---------------------------------------------------------------- 生命周期
-  async boot() {
-    this.opts.onStatus?.('启动虚拟机');
+  /**
+   * 启动虚拟机。
+   *
+   * @param {object} [o]
+   * @param {ArrayBuffer|null} [o.initialSnapshot] v86 的 save_state() 产出的状态镜像。
+   *        给了它就不再引导内核（RAM 与设备状态直接覆盖回去），启动从 ≈30 秒
+   *        降到几秒。快照里 shell 已经是「等命令」的状态，所以 banner 不会再来一遍，
+   *        探针也要跳过 banner 等待（见 waitForShell 的 skipBanner）。
+   */
+  async boot({ initialSnapshot = null } = {}) {
+    this.opts.onStatus?.(initialSnapshot ? '恢复快照' : '启动虚拟机');
+
+    /*
+     * 入参规范化 + 早期失败。
+     *
+     * v86 对「装载失败」是**静默**的（Da() 认不出形态就返回 undefined，后面什么都没发生），
+     * 表现成"卡在 启动虚拟机 不动、串口没输出"，极难定位。所以宁可在这里就抛错。
+     */
+    const kernelOpt = kernelOption(this.opts.kernel);
+    if (this.opts.kernel?.buffer && !kernelOpt?.buffer) {
+      throw new Error('内核入参格式不对：需要 ArrayBuffer 或 Uint8Array（v86 只认 ArrayBuffer）');
+    }
+    let initBuf = null;
+    if (initialSnapshot) {
+      initBuf = asArrayBuffer(initialSnapshot);
+      if (!initBuf) throw new Error('启动快照格式不对：需要 ArrayBuffer 或 Uint8Array');
+    }
+
     const em = new V86({
       wasm_path: this.opts.wasmPath,
       bios: this.opts.bios,
       vga_bios: this.opts.vgaBios,
-      bzimage: this.opts.kernel,
+      bzimage: kernelOpt,
       cmdline: this.opts.cmdline || DEFAULT_CMDLINE,
       memory_size: this.opts.memorySize || 384 * 1024 * 1024,
       filesystem: {},
+      /*
+       * v86 的约定：initial_state 在 init() 之后、run() 之前被 restore_state()
+       * 灌进 CPU。格式必须是 { buffer: ArrayBuffer } —— 内部那句
+       * `case "initial_state": e.initial_state = r.buffer` 取的就是 .buffer。
+       */
+      initial_state: initBuf ? { buffer: initBuf } : undefined,
       autostart: true,
       /*
        * 关掉 v86 的鼠标 / 键盘适配器 —— 本项目只用串口（界面里没有 guest 画面，
@@ -281,7 +405,12 @@ export class MrpVm {
     });
     this.emulator = em;
     this._attach();
-    await this.waitForShell(this.opts.bootTimeoutMs || 180_000);
+    await this.waitForShell(
+      this.opts.bootTimeoutMs || (initialSnapshot ? 60_000 : 180_000),
+      { skipBanner: !!initialSnapshot }
+    );
+    // 恢复路径不跑 installToolchain，环境变量得在这里补 —— 见 applyToolchainEnv
+    if (initialSnapshot) this.applyToolchainEnv();
     this.ready = true;
   }
 
@@ -295,18 +424,22 @@ export class MrpVm {
    * shell 收到残缺命令（如 `ho`）就报 `-/bin/sh: ho: not found` ——
    * 这正是每次启动日志里那句噪音。所以先等 banner：banner 一出现就代表 shell 已就绪，
    * 这时再发探针就不会丢了。banner 等不到（比如换过内核镜像）就退回探针兜底。
+   *
+   * 从快照恢复时传 skipBanner：/etc/profile 早就跑完了，再等 banner 只会白等 60 秒。
    */
-  async waitForShell(timeoutMs) {
+  async waitForShell(timeoutMs, { skipBanner = false } = {}) {
     const deadline = Date.now() + timeoutMs;
-    try {
-      // banner 是 /etc/profile 最后几行的输出，出现即 login shell 已就绪
-      await this.waitFor(
-        /Files send via emulator appear in \/mnt\//,
-        Math.min(timeoutMs, 60_000),
-        'shell banner'
-      );
-    } catch {
-      /* banner 没等到（换过内核？）→ 继续走下面的探针兜底 */
+    if (!skipBanner) {
+      try {
+        // banner 是 /etc/profile 最后几行的输出，出现即 login shell 已就绪
+        await this.waitFor(
+          /Files send via emulator appear in \/mnt\//,
+          Math.min(timeoutMs, 60_000),
+          'shell banner'
+        );
+      } catch {
+        /* banner 没等到（换过内核？）→ 继续走下面的探针兜底 */
+      }
     }
     while (Date.now() < deadline) {
       const id = `__RDY${Math.random().toString(36).slice(2, 8)}`;
@@ -330,6 +463,116 @@ export class MrpVm {
     } catch {}
   }
 
+  // ---------------------------------------------------------------- 启动快照
+  /**
+   * 把「工具链装好、shell 等命令」这一刻存成状态镜像（v86 的 save_state）。
+   *
+   * 只能在 boot() 末尾调一次 —— 那是唯一的「干净初始状态」。用户改过工程之后再存，
+   * 刷新页面就会回到他改到一半的样子，那是行为回归。
+   *
+   * 真正的难点在 9p：`filesystem: {}` 建出来的宿主侧 inode 表是 JS 对象，不随快照走，
+   * 而 guest 内存里留着指向它的 fid。带着已挂载的 /mnt 存快照，恢复后 guest 会拿着
+   * 旧 fid 去查一张空表 —— /mnt 直接坏掉（编译时所有 putFile 都失败）。
+   * 所以顺序必须是：记录挂载参数 → umount → save_state → 立刻挂回去。
+   *
+   * umount 之后 9p 就不可写了，而 `run()` 是把脚本写进 /mnt 再 `sh` 的 —— 那几条
+   * 命令只能直接敲串口。这段时间把 _quiet 打开，命令回显和哨兵都不进可见日志
+   * （this.serial 仍然完整，waitFor 照常匹配）。
+   *
+   * @returns {Promise<{state:ArrayBuffer, share:{device:string,type:string,options:string}}>}
+   */
+  async captureSnapshot() {
+    return this._enqueue(() => this._captureSnapshotOnce());
+  }
+
+  async _captureSnapshotOnce() {
+    // 1. 记下 /mnt 的挂载参数 —— 恢复后要按原样挂回去。
+    //    读 /proc/mounts 而不是 `mount`：字段固定（device mountpoint type opts ...），
+    //    不用猜 busybox 的排版；parseShareMount 两种格式都认，换内核也不会瞎。
+    const rc = await this._runOnce(`grep -F " ${SHARE} " /proc/mounts > ${SHARE}/__mntinfo`);
+    if (rc !== 0) throw new Error('读不到共享目录的挂载信息');
+    const text = new TextDecoder().decode(await this.getFile('__mntinfo')).trim();
+    const share = parseShareMount(text);
+    if (!share) throw new Error(`共享目录的挂载方式不认识：${text.slice(0, 120)}`);
+
+    // 2. 卸载（此后 9p 不可写，只能直发串口）
+    const wasQuiet = this._quiet;
+    this._quiet = true;
+    let unmounted = false;
+    try {
+      this._send(`umount ${SHARE} 2>/dev/null\n`);
+      const id = `__UM${randomToken()}`;
+      /*
+       * 判据必须是 /proc/mounts 的**字段**格式（`host9p /mnt 9p ...`），不能写
+       * `" on /mnt "` —— 那是 mount(8) 打印给人看的格式，/proc/mounts 里没有 "on"。
+       * 写错的表现很阴险：grep 永远不命中 → 无论卸载成没成都判「已卸载」，
+       * 于是一份带着已挂载 /mnt 的快照被存下来，恢复后 9p 直接坏掉。
+       */
+      this._send(
+        `if grep -q " ${SHARE} " /proc/mounts; then echo "__UM""BUSY"; ` +
+        `else echo "${id.slice(0, 6)}""${id.slice(6)}"; fi\n`
+      );
+      try {
+        await this.waitFor(new RegExp(id), 20_000, '卸载共享目录');
+        unmounted = true;
+      } catch {
+        /* 落到下面统一处理 */
+      }
+    } finally {
+      this._quiet = wasQuiet;
+    }
+
+    if (!unmounted) {
+      // 挂回去，别把当前会话搞坏；这次就不存快照了（下次打开仍然冷启动）
+      await this._mountShareOnce(share).catch(() => {});
+      throw new Error('共享目录无法卸载（可能有进程占用）—— 本次不存快照');
+    }
+
+    // 3. save_state：停 CPU → 拷内存 → 继续跑
+    let state;
+    try {
+      this.emulator.stop?.();
+      state = await this.emulator.save_state();
+    } finally {
+      this.emulator.run?.();
+    }
+
+    // 4. 立刻挂回去：当前会话还要继续编译
+    await this._mountShareOnce(share);
+
+    return { state, share };
+  }
+
+  /** 恢复快照后重新挂载 9p 共享目录（宿主侧 inode 表是新建的、空的） */
+  async mountShare(share) {
+    return this._enqueue(() => this._mountShareOnce(share));
+  }
+
+  async _mountShareOnce(share) {
+    if (!share?.device || !share?.type) throw new Error('缺少共享目录挂载参数');
+    const wasQuiet = this._quiet;
+    this._quiet = true;
+    try {
+      this._send(`mkdir -p ${SHARE}\n`);
+      this._send(`mount -t ${share.type} -o ${share.options} ${share.device} ${SHARE}\n`);
+      const id = `__MT${randomToken()}`;
+      this._send(
+        `if grep -q " ${SHARE} " /proc/mounts; then ` +
+        `echo "${id.slice(0, 6)}""${id.slice(6)}"; else echo "__MT""FAIL"; fi\n`
+      );
+      try {
+        await this.waitFor(new RegExp(id), 20_000, '挂载共享目录');
+      } catch {
+        // 把串口尾巴带出来：mount 的报错就在那儿（这段被 _quiet 挡着，看不到）
+        const tail = this.serial.slice(-400).replace(/\r/g, '').trim();
+        throw new Error(`挂载共享目录失败（${share.device} → ${SHARE}）：${tail}`);
+      }
+      return true;
+    } finally {
+      this._quiet = wasQuiet;
+    }
+  }
+
   // ---------------------------------------------------------------- 文件通道
   async putFile(name, bytes) {
     await this.emulator.create_file(name, bytes);
@@ -340,6 +583,22 @@ export class MrpVm {
   }
 
   // ---------------------------------------------------------------- 工具链
+  /**
+   * 工具链依赖的环境变量，统一装配（每条命令开头由 _runOnce 重放）。
+   *
+   * 抽成方法是因为有两条路径要用它：
+   *   · 冷启动：installToolchain 里调；
+   *   · 从快照恢复：installToolchain **不跑**，而 env 挂在 MrpVm 实例上、
+   *     新实例里是空的 —— 不重新装配，gcc 根本不在 PATH 里，链接也找不到
+   *     ld-linux.so.2（表现是 "cannot execute 'cc1'" 或 glibc 报错）。
+   */
+  applyToolchainEnv() {
+    this.setEnv('LD_LIBRARY_PATH', LIBDIRS);
+    this.setEnv('PATH', `${TC}/usr/bin:/usr/bin:/bin:/sbin`);
+    this.setEnv('COMPILER_PATH', `${TC}/usr/bin`);
+    this.setEnv('CPATH', `${TC}/usr/include/newlib`);
+  }
+
   /** 把工具链 tarball 推进虚拟机并解压、配好 glibc 环境 */
   /**
    * 把工具链镜像推进虚拟机并解压、配好环境。
@@ -436,8 +695,7 @@ export class MrpVm {
      * 有没有生效"这种状态。所以记在实例上，由 _runOnce 写进每个脚本的开头：
      * 自包含、不依赖 shell 状态，也省掉 4 次串口往返。
      */
-    this.setEnv('LD_LIBRARY_PATH', LIBDIRS);
-    this.setEnv('PATH', `${TC}/usr/bin:/usr/bin:/bin:/sbin`);
+    this.applyToolchainEnv();
 
     // 关键：工具链在 /opt/tc/usr 而不是编译期前缀 /usr，GCC 按自己的搜索路径
     // 找不到 assembler / linker，最后会退化成 execvp("as") 并报
@@ -452,11 +710,12 @@ export class MrpVm {
       { timeout: 120_000 }
     );
     if (rc !== 0) throw new Error('创建无前缀工具软链失败');
-    this.setEnv('COMPILER_PATH', `${TC}/usr/bin`);
-
-    // 标准 C 头文件：Debian 把 newlib 的头放在 usr/include/newlib。
-    // 用 CPATH 显式加进去，保证 #include <stdlib.h> 之类一定能解析。
-    this.setEnv('CPATH', `${TC}/usr/include/newlib`);
+    /*
+     * COMPILER_PATH / CPATH 已经由 applyToolchainEnv() 一起设好了：
+     *   COMPILER_PATH → 让 gcc 在 /opt/tc/usr/bin 下找 as/ld（它编译期前缀是 /usr）
+     *   CPATH         → Debian 把 newlib 的头放在 usr/include/newlib
+     * 和 PATH / LD_LIBRARY_PATH 放在同一处，恢复快照后重新装配时不会漏。
+     */
 
     // 自检：确认工具链真的能跑
     rc = await this.run(`${TC}/usr/bin/arm-none-eabi-gcc --version | head -1`);

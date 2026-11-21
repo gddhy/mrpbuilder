@@ -658,8 +658,14 @@ def main():
     log(f"已按 {PART_BYTES/1048576:.0f} MiB 切成 {len(parts)} 段（rootfs.parts.json）")
 
     # 把内核也复制过去（网页要一起加载）
+    kern_out = os.path.join(OUT_DIR, "vmlinuz.bin")
     shutil.copy2(kern_local, os.path.join(OUT_DIR, "vmlinuz.bin"))
-    log(f"已复制内核到 {os.path.join(OUT_DIR, 'vmlinuz.bin')}")
+    log(f"已复制内核到 {kern_out}")
+    # 内核摘要也记下来：网页用它判断 IndexedDB 里那份内核缓存有没有过期
+    # （快照恢复路径只依赖内核，不依赖 31 MiB 的 rootfs，见 assets/snapshot.js）
+    with open(kern_out, "rb") as f:
+        kern_blob = f.read()
+    kern_sha = hashlib.sha256(kern_blob).hexdigest()
 
     # 记录元信息
     meta = {
@@ -667,6 +673,8 @@ def main():
         "arch": ARCH,
         "packages": {n: pkgs[n].get("Version") for n in needed},
         "kernel": args.kernel,
+        "kernel_bytes": len(kern_blob),
+        "kernel_sha256": kern_sha,
         "rootfs_bytes": rootfs_bytes,
         "rootfs_tar_bytes": tgz_bytes,
         "rootfs_tar_sha256": tgz_sha,

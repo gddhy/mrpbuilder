@@ -218,7 +218,8 @@
         <h3>加载编译环境</h3>
         <p>点顶栏的「启动编译环境」。它会启动一台内置的 32 位 Linux，并把
           <code>arm-none-eabi-gcc</code> 工具链装进去。首次约 20~30 秒，
-          状态变成「环境就绪」（左侧圆点转绿）后才能编译。</p>
+          状态变成「环境就绪」（左侧圆点转绿）后才能编译。
+          <b>这次初始化会被存成本地快照</b>，以后打开页面直接从快照恢复，通常几秒就好。</p>
       </li>
       <li>
         <h3>导入工程代码</h3>
@@ -275,6 +276,6 @@
   </div>
 </div>
 
-<script type="module" src="assets/app.js?v=20261016a"></script>
+<script type="module" src="assets/app.js?v=20261121a"></script>
 </body>
 </html>
